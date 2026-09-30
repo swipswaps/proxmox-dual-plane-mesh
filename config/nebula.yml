@@ -20,7 +20,6 @@ punchy:
   punch: true
   respond: true
 
-# Fast re-resolution: survives dynamic DNS IP rotation on the lighthouse.
 handshakes:
   try_interval: 100ms
   query_interval: 5s

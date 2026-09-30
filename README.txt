@@ -65,24 +65,32 @@ Do NOT use lxc.apparmor.profile: unconfined. Unconfined profiles expose the
 Proxmox host kernel to Spectre V2 (Branch Target Injection) and speculative
 execution side-channel attacks via eBPF.
 
-Run install.sh on the Proxmox host first with the container ID:
+Two supported install paths:
 
-  curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/proxmox-dual-plane-mesh/main/install.sh | bash -s -- <CT_ID>
+  Path A (from a local clone):
+    git clone https://github.com/swipswaps/proxmox-dual-plane-mesh.git /opt/proxmox-dual-plane-mesh
+    cd /opt/proxmox-dual-plane-mesh
+    sudo ./install.sh <CT_ID>       # on Proxmox host
+    sudo ./install.sh               # inside LXC container
+
+  Path B (one-liner, auto-clones repo):
+    On Proxmox host:
+      curl -fsSL https://raw.githubusercontent.com/swipswaps/proxmox-dual-plane-mesh/main/install.sh | sudo bash -s -- <CT_ID>
+    Inside LXC container:
+      pct enter <CT_ID>
+      curl -fsSL https://raw.githubusercontent.com/swipswaps/proxmox-dual-plane-mesh/main/install.sh | sudo bash
 
 4. INSTALLATION INSIDE LXC
 --------------------------
-Enter the container and run install.sh:
-
-  pct enter <CT_ID>
-  curl -fsSL https://raw.githubusercontent.com/YOUR_ORG/proxmox-dual-plane-mesh/main/install.sh | bash
-
-The script will interactively:
+The installer will interactively:
+  - Resolve or clone the repository to /opt/proxmox-dual-plane-mesh
   - Install all system packages
-  - Install Nebula, Ollama, Semgrep
+  - Install Nebula, Ollama, Semgrep, ebpf_exporter
+  - Deploy config/ and systemd/ units from the repo
   - Prompt for node role (Lighthouse or Client)
   - Generate or import Nebula PKI certificates
   - Write /etc/nebula/config.yml
-  - Deploy and enable all systemd services and monitoring configs
+  - Register systemd services
   - Run full-stack diagnostics
 
 5. CREDENTIALS & CERTIFICATE PROVISIONING

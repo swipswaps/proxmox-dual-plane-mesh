@@ -2,6 +2,11 @@
 # COMPREHENSIVE MESH, TELEMETRY & FULL-STACK DIAGNOSTIC INSTALLER
 # errexit intentionally disabled: every critical command is checked
 # explicitly so failures are loud, diagnosed, and never silent.
+#
+# Idempotent: safe to re-run from any of these invocation modes:
+#   1. Local clone:       sudo ./install.sh [CT_ID]
+#   2. Piped from URL:    curl -fsSL <url>/install.sh | sudo bash -s -- [CT_ID]
+#   3. Diagnostics only:  sudo ./install.sh --doctor
 set -uo pipefail
 
 RED='\033[0;31m'
@@ -21,9 +26,83 @@ if [[ $EUID -ne 0 ]]; then
    exit 3
 fi
 
+# ==============================================================================
+# IDEMPOTENT REPO BOOTSTRAP PREAMBLE
+# ==============================================================================
+# Establishes a valid REPO_ROOT regardless of invocation mode.
+#
+# Resolution order (first match wins):
+#   1. $REPO_ROOT already exported by caller.
+#   2. Local clone: install.sh sits inside a repo that contains config/ and
+#      systemd/ next to it. Use that directory.
+#   3. /opt/proxmox-dual-plane-mesh already exists from a previous run. Reuse.
+#   4. Piped-from-URL with no local repo: clone into /opt/proxmox-dual-plane-mesh.
+# ==============================================================================
+
+REPO_NAME_DEFAULT="proxmox-dual-plane-mesh"
+REPO_URL="${REPO_URL:-https://github.com/swipswaps/proxmox-dual-plane-mesh.git}"
+REPO_ROOT="${REPO_ROOT:-}"
+
+resolve_repo_root() {
+    if [[ -n "${REPO_ROOT}" ]] && [[ -d "${REPO_ROOT}/config" ]] && [[ -d "${REPO_ROOT}/systemd" ]]; then
+        log_info "Using REPO_ROOT from environment: ${REPO_ROOT}"
+        return 0
+    fi
+
+    local self_dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" ]] && [[ -f "${BASH_SOURCE[0]}" ]]; then
+        self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [[ -n "${self_dir}" ]] && [[ -d "${self_dir}/config" ]] && [[ -d "${self_dir}/systemd" ]]; then
+        REPO_ROOT="${self_dir}"
+        log_info "Using local clone at: ${REPO_ROOT}"
+        return 0
+    fi
+
+    if [[ -d "/opt/${REPO_NAME_DEFAULT}/config" ]] && [[ -d "/opt/${REPO_NAME_DEFAULT}/systemd" ]]; then
+        REPO_ROOT="/opt/${REPO_NAME_DEFAULT}"
+        log_info "Reusing existing repo at: ${REPO_ROOT}"
+        return 0
+    fi
+
+    log_warn "No local repo detected (piped-from-URL mode)."
+    log_info "Cloning ${REPO_URL} into /opt/${REPO_NAME_DEFAULT} ..."
+    if ! command -v git >/dev/null; then
+        log_warn "git not installed yet. Installing minimal git now."
+        apt-get update -y || { log_err "apt-get update failed"; return 2; }
+        apt-get install -y git || { log_err "git install failed"; return 2; }
+    fi
+    mkdir -p /opt || { log_err "cannot create /opt"; return 2; }
+    if git clone "${REPO_URL}" "/opt/${REPO_NAME_DEFAULT}"; then
+        REPO_ROOT="/opt/${REPO_NAME_DEFAULT}"
+        log_info "Repo cloned to: ${REPO_ROOT}"
+        return 0
+    fi
+
+    log_err "Failed to establish REPO_ROOT. Set REPO_ROOT=<path> or REPO_URL=<url> and retry."
+    return 2
+}
+
+if ! resolve_repo_root; then
+    exit 2
+fi
+
+if [[ ! -d "${REPO_ROOT}/config" ]] || [[ ! -d "${REPO_ROOT}/systemd" ]]; then
+    log_err "REPO_ROOT=${REPO_ROOT} is missing config/ or systemd/. Aborting."
+    exit 2
+fi
+
+# ==============================================================================
+# ENVIRONMENT DETECTION
+# ==============================================================================
+
 is_pve_host() {
     [[ -f /etc/pve/pve-root-ca.pem ]] || command -v pveversion >/dev/null
 }
+
+# ==============================================================================
+# DIAGNOSTICS
+# ==============================================================================
 
 run_full_diagnostics() {
     echo -e "\n${BOLD}=== Running Full-Stack Diagnostics ===${NC}\n"
@@ -127,6 +206,10 @@ run_full_diagnostics() {
     echo -e "\n${GREEN}[SUCCESS] Full-stack diagnostics complete.${NC}\n"
 }
 
+# ==============================================================================
+# PROXMOX HOST HARDENING
+# ==============================================================================
+
 setup_proxmox_host() {
     log_step "Proxmox VE Host detected."
 
@@ -195,15 +278,18 @@ PYEOF
     log_info "Host configuration complete!"
 }
 
+# ==============================================================================
+# CONTAINER SERVICE DEPLOYMENT (idempotent, uses global REPO_ROOT)
+# ==============================================================================
+
 deploy_services() {
     log_step "Deploying systemd units and monitoring configs..."
-    local REPO_ROOT
-    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || { log_err "cannot resolve repo root"; return 2; }
+    log_info "Using REPO_ROOT=${REPO_ROOT}"
 
     if [[ -d "${REPO_ROOT}/systemd" ]]; then
         cp "${REPO_ROOT}/systemd/"*.service /etc/systemd/system/ || { log_err "systemd unit copy failed"; return 2; }
     else
-        log_warn "no systemd/ directory in ${REPO_ROOT}; skipping unit copy"
+        log_err "systemd/ directory missing in ${REPO_ROOT}"; return 2
     fi
 
     if [[ -f "${REPO_ROOT}/config/prometheus.yml" ]]; then
@@ -229,6 +315,10 @@ deploy_services() {
     return 0
 }
 
+# ==============================================================================
+# LXC CONTAINER INSTALLATION
+# ==============================================================================
+
 setup_node_environment() {
     log_step "Installing system packages, Ollama, and pipeline tools..."
 
@@ -238,7 +328,7 @@ setup_node_environment() {
     apt-get install -y \
         curl wget gnupg lsb-release ca-certificates git build-essential \
         python3 python3-pip python3-venv socat iperf3 inadyn tor \
-        prometheus prometheus-blackbox-exporter bpfcc-tools \
+        prometheus prometheus-blackbox-exporter prometheus-node-exporter bpfcc-tools \
         net-tools iproute2 host netcat-openbsd || { log_err "package installation failed"; exit 2; }
 
     if ! command -v ollama >/dev/null; then
@@ -249,6 +339,7 @@ setup_node_environment() {
     NEBULA_VERSION="v1.9.5"
     ARCH="amd64"
     TMP_DIR=$(mktemp -d) || { log_err "mktemp failed"; exit 2; }
+
     if [[ ! -f /usr/local/bin/nebula ]]; then
         log_info "Installing Nebula ${NEBULA_VERSION}..."
         if wget -q -O "${TMP_DIR}/nebula.tar.gz" "https://github.com/slackhq/nebula/releases/download/${NEBULA_VERSION}/nebula-linux-${ARCH}.tar.gz"; then
@@ -259,7 +350,6 @@ setup_node_environment() {
             exit 2
         fi
     fi
-    rm -rf "${TMP_DIR}"
 
     if ! command -v ebpf_exporter >/dev/null; then
         EBPF_VER="v3.5.0"
@@ -273,7 +363,10 @@ setup_node_environment() {
         fi
     fi
 
+    rm -rf "${TMP_DIR}"
+
     mkdir -p /etc/nebula /etc/prometheus /etc/tor /etc/typesafe /var/lib/tor/hidden_service/ || { log_err "mkdir system dirs failed"; exit 2; }
+    chmod 700 /etc/nebula || log_warn "chmod /etc/nebula failed"
 
     echo -e "\n${BOLD}=== Interactive Mesh & Telemetry Setup ===${NC}"
     echo "1) Setup as LIGHTHOUSE (Central Anchor)"
@@ -412,6 +505,10 @@ SVCEOF
 
     run_full_diagnostics
 }
+
+# ==============================================================================
+# MAIN ROUTER
+# ==============================================================================
 
 if [[ "${1:-}" == "--doctor" ]]; then
     run_full_diagnostics

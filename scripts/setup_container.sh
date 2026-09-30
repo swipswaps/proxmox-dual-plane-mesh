@@ -15,7 +15,7 @@ apt-get upgrade -y || log_warn "apt-get upgrade reported errors; continuing"
 apt-get install -y \
     curl wget gnupg lsb-release ca-certificates git build-essential \
     python3 python3-pip python3-venv socat iperf3 inadyn tor \
-    prometheus prometheus-blackbox-exporter bpfcc-tools \
+    prometheus prometheus-blackbox-exporter prometheus-node-exporter bpfcc-tools \
     net-tools iproute2 host netcat-openbsd || { log_err "package installation failed"; exit 2; }
 
 NEBULA_VERSION="v1.9.5"
