@@ -7,6 +7,11 @@
 #   1. Local clone:       sudo ./install.sh [CT_ID]
 #   2. Piped from URL:    curl -fsSL <url>/install.sh | sudo bash -s -- [CT_ID]
 #   3. Diagnostics only:  sudo ./install.sh --doctor
+#
+# Supported platforms:
+#   - Proxmox VE host (Debian-based)
+#   - Debian / Ubuntu (LXC or bare metal)
+#   - Fedora / RHEL family (LXC or bare metal desktop, incl. Fedora 43 XFCE)
 set -uo pipefail
 
 RED='\033[0;31m'
@@ -27,16 +32,78 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ==============================================================================
-# IDEMPOTENT REPO BOOTSTRAP PREAMBLE
+# OS DETECTION
 # ==============================================================================
-# Establishes a valid REPO_ROOT regardless of invocation mode.
-#
-# Resolution order (first match wins):
-#   1. $REPO_ROOT already exported by caller.
-#   2. Local clone: install.sh sits inside a repo that contains config/ and
-#      systemd/ next to it. Use that directory.
-#   3. /opt/proxmox-dual-plane-mesh already exists from a previous run. Reuse.
-#   4. Piped-from-URL with no local repo: clone into /opt/proxmox-dual-plane-mesh.
+# Sets:
+#   OS_FAMILY   = "debian" | "fedora" | "unknown"
+#   PKG_MGR     = "apt-get" | "dnf"
+#   PKG_INSTALL = "apt-get install -y" | "dnf install -y"
+#   PKG_UPDATE  = "apt-get update -y"  | "dnf makecache"
+#   TOR_USER    = "debian-tor"         | "tor"
+# ==============================================================================
+
+OS_FAMILY="unknown"
+PKG_MGR=""
+PKG_INSTALL=""
+PKG_UPDATE=""
+TOR_USER=""
+
+detect_os() {
+    if [[ -f /etc/fedora-release ]] || [[ -f /etc/redhat-release ]]; then
+        OS_FAMILY="fedora"
+        if command -v dnf >/dev/null; then
+            PKG_MGR="dnf"
+        else
+            PKG_MGR="yum"
+        fi
+        PKG_INSTALL="${PKG_MGR} install -y"
+        PKG_UPDATE="${PKG_MGR} makecache"
+        TOR_USER="tor"
+    elif [[ -f /etc/debian_version ]]; then
+        OS_FAMILY="debian"
+        PKG_MGR="apt-get"
+        PKG_INSTALL="apt-get install -y"
+        PKG_UPDATE="apt-get update -y"
+        TOR_USER="debian-tor"
+    else
+        log_err "Unsupported OS: neither /etc/debian_version nor /etc/fedora-release present."
+        log_err "Set OS_FAMILY=debian or OS_FAMILY=fedora and re-run."
+        return 2
+    fi
+    log_info "Detected OS family: ${OS_FAMILY} (pkg manager: ${PKG_MGR})"
+    return 0
+}
+
+if ! detect_os; then
+    exit 2
+fi
+
+# ==============================================================================
+# PACKAGE NAME MAPPING
+# ==============================================================================
+
+pkg_name_for() {
+    local logical="$1"
+    if [[ "${OS_FAMILY}" == "fedora" ]]; then
+        case "${logical}" in
+            prometheus-node-exporter) echo "node_exporter" ;;
+            prometheus-blackbox-exporter) echo "golang-github-prometheus-blackbox-exporter" ;;
+            bpfcc-tools) echo "bcc-tools" ;;
+            build-essential) echo "gcc gcc-c++ make" ;;
+            python3-venv) echo "python3-virtualenv" ;;
+            netcat-openbsd) echo "nmap-ncat" ;;
+            host) echo "bind-utils" ;;
+            lsb-release) echo "redhat-lsb-core" ;;
+            gnupg) echo "gnupg2" ;;
+            *) echo "${logical}" ;;
+        esac
+    else
+        echo "${logical}"
+    fi
+}
+
+# ==============================================================================
+# IDEMPOTENT REPO BOOTSTRAP PREAMBLE
 # ==============================================================================
 
 REPO_NAME_DEFAULT="proxmox-dual-plane-mesh"
@@ -69,8 +136,12 @@ resolve_repo_root() {
     log_info "Cloning ${REPO_URL} into /opt/${REPO_NAME_DEFAULT} ..."
     if ! command -v git >/dev/null; then
         log_warn "git not installed yet. Installing minimal git now."
-        apt-get update -y || { log_err "apt-get update failed"; return 2; }
-        apt-get install -y git || { log_err "git install failed"; return 2; }
+        if [[ "${OS_FAMILY}" == "fedora" ]]; then
+            ${PKG_INSTALL} git || { log_err "git install failed"; return 2; }
+        else
+            apt-get update -y || { log_err "apt-get update failed"; return 2; }
+            apt-get install -y git || { log_err "git install failed"; return 2; }
+        fi
     fi
     mkdir -p /opt || { log_err "cannot create /opt"; return 2; }
     if git clone "${REPO_URL}" "/opt/${REPO_NAME_DEFAULT}"; then
@@ -115,7 +186,7 @@ run_full_diagnostics() {
             chmod 666 /dev/net/tun
             log_info "TUN device created."
         else
-            log_err "Failed to mknod TUN device. Verify host LXC config."
+            log_err "Failed to mknod TUN device. Verify host container configuration."
         fi
     else
         log_info "TUN device verified: OK"
@@ -134,9 +205,13 @@ run_full_diagnostics() {
 
     log_step "3/8 Verifying Tor Directory Permissions..."
     if [[ -d /var/lib/tor/hidden_service ]]; then
-        chown -R debian-tor:debian-tor /var/lib/tor/ || log_warn "chown tor dir failed"
+        if id "${TOR_USER}" >/dev/null; then
+            chown -R "${TOR_USER}:${TOR_USER}" /var/lib/tor/ || log_warn "chown tor dir failed"
+        else
+            log_warn "tor user '${TOR_USER}' does not exist yet; skipping chown"
+        fi
         chmod 700 /var/lib/tor/hidden_service/ || log_warn "chmod tor dir failed"
-        log_info "Tor permissions set to 0700 debian-tor: OK"
+        log_info "Tor permissions set to 0700 ${TOR_USER}: OK"
     fi
 
     log_step "4/8 Validating Nebula PKI..."
@@ -151,8 +226,14 @@ run_full_diagnostics() {
     if command -v semgrep >/dev/null; then
         log_info "Semgrep binary found."
     else
-        log_warn "Semgrep binary missing. Installing via pip..."
-        pip3 install --break-system-packages semgrep || pip3 install semgrep || log_err "Failed to install Semgrep."
+        log_warn "Semgrep binary missing. Installing..."
+        if command -v pipx >/dev/null; then
+            pipx install semgrep || log_err "pipx semgrep install failed."
+        else
+            pip3 install --break-system-packages semgrep || \
+            pip3 install semgrep || \
+            log_err "Failed to install Semgrep."
+        fi
     fi
 
     log_step "6/8 Checking Ollama Local LLM Daemon & Models..."
@@ -207,7 +288,7 @@ run_full_diagnostics() {
 }
 
 # ==============================================================================
-# PROXMOX HOST HARDENING
+# PROXMOX HOST HARDENING (Debian-based host)
 # ==============================================================================
 
 setup_proxmox_host() {
@@ -279,7 +360,7 @@ PYEOF
 }
 
 # ==============================================================================
-# CONTAINER SERVICE DEPLOYMENT (idempotent, uses global REPO_ROOT)
+# SERVICE DEPLOYMENT (idempotent, uses global REPO_ROOT)
 # ==============================================================================
 
 deploy_services() {
@@ -316,57 +397,123 @@ deploy_services() {
 }
 
 # ==============================================================================
-# LXC CONTAINER INSTALLATION
+# FIREWALL (Fedora only; Debian path is a no-op)
+# ==============================================================================
+
+configure_firewall_if_present() {
+    if [[ "${OS_FAMILY}" != "fedora" ]]; then
+        return 0
+    fi
+    if ! command -v firewall-cmd >/dev/null; then
+        log_info "firewalld not present; skipping firewall configuration."
+        return 0
+    fi
+    log_step "Configuring firewalld rules for mesh ports..."
+    firewall-cmd --permanent --add-port=4242/udp || log_warn "failed to open UDP 4242"
+    firewall-cmd --permanent --add-port=5201/tcp || log_warn "failed to open TCP 5201"
+    firewall-cmd --permanent --add-port=9100/tcp || log_warn "failed to open TCP 9100"
+    firewall-cmd --permanent --add-port=9090/tcp || log_warn "failed to open TCP 9090"
+    firewall-cmd --reload || log_warn "firewalld reload failed"
+    log_info "Firewall rules applied."
+    return 0
+}
+
+# ==============================================================================
+# PACKAGE INSTALLATION (Debian and Fedora)
+# ==============================================================================
+
+install_packages_for_os() {
+    local logical_pkgs=(
+        curl wget gnupg lsb-release ca-certificates git build-essential
+        python3 python3-pip python3-venv socat iperf3 inadyn tor
+        prometheus prometheus-blackbox-exporter prometheus-node-exporter
+        bpfcc-tools net-tools iproute2 host netcat-openbsd
+    )
+
+    local resolved=""
+    local p
+    for p in "${logical_pkgs[@]}"; do
+        resolved="${resolved} $(pkg_name_for "${p}")"
+    done
+
+    log_info "Resolved package list for ${OS_FAMILY}:${resolved}"
+
+    if [[ "${OS_FAMILY}" == "fedora" ]]; then
+        ${PKG_UPDATE} || log_warn "${PKG_MGR} makecache reported errors; continuing"
+    else
+        ${PKG_UPDATE} || { log_err "${PKG_UPDATE} failed"; exit 2; }
+    fi
+
+    # shellcheck disable=SC2086
+    ${PKG_INSTALL} ${resolved} || { log_err "package installation failed"; exit 2; }
+    return 0
+}
+
+install_ollama_if_missing() {
+    if command -v ollama >/dev/null; then
+        return 0
+    fi
+    log_info "Installing Ollama..."
+    curl -fsSL https://ollama.com/install.sh | sh || log_warn "Ollama installer returned non-zero."
+    return 0
+}
+
+install_nebula_if_missing() {
+    if [[ -f /usr/local/bin/nebula ]]; then
+        return 0
+    fi
+    log_info "Installing Nebula ${NEBULA_VERSION}..."
+    if wget -q -O "${TMP_DIR}/nebula.tar.gz" "https://github.com/slackhq/nebula/releases/download/${NEBULA_VERSION}/nebula-linux-${ARCH}.tar.gz"; then
+        tar -xzf "${TMP_DIR}/nebula.tar.gz" -C /usr/local/bin/ nebula nebula-cert || { log_err "nebula extract failed"; exit 2; }
+        chmod +x /usr/local/bin/nebula /usr/local/bin/nebula-cert || { log_err "chmod nebula failed"; exit 2; }
+    else
+        log_err "nebula download failed"
+        exit 2
+    fi
+    return 0
+}
+
+install_ebpf_exporter_if_missing() {
+    if command -v ebpf_exporter >/dev/null; then
+        return 0
+    fi
+    log_info "Fetching ebpf_exporter binary ${EBPF_VER}..."
+    if wget -q -O "${TMP_DIR}/ebpf_exporter.tar.gz" "https://github.com/cloudflare/ebpf_exporter/releases/download/${EBPF_VER}/ebpf_exporter-${EBPF_VER}-linux-amd64.tar.gz"; then
+        tar -xzf "${TMP_DIR}/ebpf_exporter.tar.gz" -C /usr/local/bin/ || log_warn "ebpf_exporter extract failed"
+        [[ -f /usr/local/bin/ebpf_exporter-linux-amd64 ]] && mv /usr/local/bin/ebpf_exporter-linux-amd64 /usr/local/bin/ebpf_exporter
+        chmod +x /usr/local/bin/ebpf_exporter || log_warn "chmod ebpf_exporter failed"
+    else
+        log_warn "ebpf_exporter download failed; eBPF metrics will be unavailable."
+    fi
+    return 0
+}
+
+# ==============================================================================
+# NODE ENVIRONMENT INSTALLATION
 # ==============================================================================
 
 setup_node_environment() {
     log_step "Installing system packages, Ollama, and pipeline tools..."
 
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y || { log_err "apt-get update failed"; exit 2; }
-    apt-get upgrade -y || log_warn "apt-get upgrade reported errors; continuing"
-    apt-get install -y \
-        curl wget gnupg lsb-release ca-certificates git build-essential \
-        python3 python3-pip python3-venv socat iperf3 inadyn tor \
-        prometheus prometheus-blackbox-exporter prometheus-node-exporter bpfcc-tools \
-        net-tools iproute2 host netcat-openbsd || { log_err "package installation failed"; exit 2; }
 
-    if ! command -v ollama >/dev/null; then
-        log_info "Installing Ollama..."
-        curl -fsSL https://ollama.com/install.sh | sh || log_warn "Ollama installer returned non-zero."
-    fi
+    install_packages_for_os
+    install_ollama_if_missing
 
     NEBULA_VERSION="v1.9.5"
     ARCH="amd64"
+    EBPF_VER="v3.5.0"
     TMP_DIR=$(mktemp -d) || { log_err "mktemp failed"; exit 2; }
 
-    if [[ ! -f /usr/local/bin/nebula ]]; then
-        log_info "Installing Nebula ${NEBULA_VERSION}..."
-        if wget -q -O "${TMP_DIR}/nebula.tar.gz" "https://github.com/slackhq/nebula/releases/download/${NEBULA_VERSION}/nebula-linux-${ARCH}.tar.gz"; then
-            tar -xzf "${TMP_DIR}/nebula.tar.gz" -C /usr/local/bin/ nebula nebula-cert || { log_err "nebula extract failed"; exit 2; }
-            chmod +x /usr/local/bin/nebula /usr/local/bin/nebula-cert || { log_err "chmod nebula failed"; exit 2; }
-        else
-            log_err "nebula download failed"
-            exit 2
-        fi
-    fi
-
-    if ! command -v ebpf_exporter >/dev/null; then
-        EBPF_VER="v3.5.0"
-        log_info "Fetching ebpf_exporter binary ${EBPF_VER}..."
-        if wget -q -O "${TMP_DIR}/ebpf_exporter.tar.gz" "https://github.com/cloudflare/ebpf_exporter/releases/download/${EBPF_VER}/ebpf_exporter-${EBPF_VER}-linux-amd64.tar.gz"; then
-            tar -xzf "${TMP_DIR}/ebpf_exporter.tar.gz" -C /usr/local/bin/ || log_warn "ebpf_exporter extract failed"
-            [[ -f /usr/local/bin/ebpf_exporter-linux-amd64 ]] && mv /usr/local/bin/ebpf_exporter-linux-amd64 /usr/local/bin/ebpf_exporter
-            chmod +x /usr/local/bin/ebpf_exporter || log_warn "chmod ebpf_exporter failed"
-        else
-            log_warn "ebpf_exporter download failed; eBPF metrics will be unavailable."
-        fi
-    fi
+    install_nebula_if_missing
+    install_ebpf_exporter_if_missing
 
     rm -rf "${TMP_DIR}"
 
     mkdir -p /etc/nebula /etc/prometheus /etc/tor /etc/typesafe /var/lib/tor/hidden_service/ || { log_err "mkdir system dirs failed"; exit 2; }
     chmod 700 /etc/nebula || log_warn "chmod /etc/nebula failed"
+
+    configure_firewall_if_present
 
     echo -e "\n${BOLD}=== Interactive Mesh & Telemetry Setup ===${NC}"
     echo "1) Setup as LIGHTHOUSE (Central Anchor)"
@@ -500,8 +647,15 @@ SVCEOF
 
     systemctl enable nebula --now || log_warn "nebula.service could not be started yet (certificates pending?)"
 
-    pip3 install --break-system-packages pydantic pyyaml requests instructor ollama rich semgrep || \
-    pip3 install pydantic pyyaml requests instructor ollama rich semgrep || log_warn "pip install reported errors"
+    if command -v pipx >/dev/null; then
+        pipx install --force pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
+        pipx install pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
+        log_warn "pipx install reported errors"
+    else
+        pip3 install --break-system-packages pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
+        pip3 install pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
+        log_warn "pip install reported errors"
+    fi
 
     run_full_diagnostics
 }

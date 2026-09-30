@@ -3,18 +3,19 @@ PROXMOX DUAL-PLANE LIGHTHOUSE & TELEMETRY MESH
 
 1. SYSTEM OVERVIEW
 ------------------
-Dual-path overlay network node inside a secured unprivileged Proxmox VE
-LXC container.
+Dual-path overlay network node with tiered monitoring. Runs on Proxmox VE
+LXC containers, Debian/Ubuntu hosts, and Fedora/RHEL-family hosts
+(including Fedora 43 X11 XFCE desktops).
 
 Signaling channels:
   Strategy A: Direct ClearNet Dynamic DNS (inadyn) for minimal latency.
   Strategy B: Tor v3 Onion Service rendezvous for CGNAT fallback.
 
-Benchmarking pipeline uses Blackbox Exporter, iperf3, and ebpf_exporter to
+Benchmarking uses Blackbox Exporter, iperf3, and ebpf_exporter to
 cross-benchmark both paths and flag latency spikes, jitter anomalies, DPI,
 or MitM interception.
 
-Tiered monitoring pipeline uses local open-source models (Ollama + Instructor)
+Tiered monitoring uses local open-source models (Ollama + Instructor)
 for Tier 1 detection and TypeSafe AI Jev for Tier 2 verification.
 
 All shell scripts use explicit error handling (no errexit) and exit codes
@@ -59,7 +60,17 @@ All shell scripts use explicit error handling (no errexit) and exit codes
     |-- run_iperf_audit.py
     |-- check_constraints.sh
 
-3. PREREQUISITES & PROXMOX HOST HARDENING
+3. SUPPORTED PLATFORMS
+----------------------
+- Proxmox VE host (Debian-based) for LXC container hardening
+- Debian / Ubuntu LXC or bare metal
+- Fedora / RHEL family (bare metal desktop or LXC)
+
+The installer auto-detects the OS family and maps logical package names
+to distro-specific names (for example, prometheus-node-exporter on Debian
+becomes node_exporter on Fedora).
+
+4. PREREQUISITES & PROXMOX HOST HARDENING
 -----------------------------------------
 Do NOT use lxc.apparmor.profile: unconfined. Unconfined profiles expose the
 Proxmox host kernel to Spectre V2 (Branch Target Injection) and speculative
@@ -79,13 +90,17 @@ Two supported install paths:
     Inside LXC container:
       pct enter <CT_ID>
       curl -fsSL https://raw.githubusercontent.com/swipswaps/proxmox-dual-plane-mesh/main/install.sh | sudo bash
+    On Fedora 43 desktop:
+      curl -fsSL https://raw.githubusercontent.com/swipswaps/proxmox-dual-plane-mesh/main/install.sh | sudo bash
 
-4. INSTALLATION INSIDE LXC
---------------------------
+5. INSTALLATION
+---------------
 The installer will interactively:
+  - Detect OS family (Debian or Fedora) and choose apt-get or dnf
   - Resolve or clone the repository to /opt/proxmox-dual-plane-mesh
-  - Install all system packages
+  - Install all system packages using distro-correct names
   - Install Nebula, Ollama, Semgrep, ebpf_exporter
+  - Apply firewalld rules on Fedora (no-op on Debian)
   - Deploy config/ and systemd/ units from the repo
   - Prompt for node role (Lighthouse or Client)
   - Generate or import Nebula PKI certificates
@@ -93,7 +108,7 @@ The installer will interactively:
   - Register systemd services
   - Run full-stack diagnostics
 
-5. CREDENTIALS & CERTIFICATE PROVISIONING
+6. CREDENTIALS & CERTIFICATE PROVISIONING
 -----------------------------------------
 For the offline CA machine (recommended for production):
   nebula-cert ca -name "My Mesh CA"
@@ -102,7 +117,7 @@ For the offline CA machine (recommended for production):
 Copy ca.crt, host.crt, and host.key to /etc/nebula/ on each node.
 Set restrictive permissions: chmod 600 /etc/nebula/host.key
 
-6. VERIFICATION & TELEMETRY
+7. VERIFICATION & TELEMETRY
 ---------------------------
 Run connectivity verification (exit 0 = healthy, exit 2 = failures found):
   ./scripts/verify_connectivity.sh
@@ -114,34 +129,33 @@ Run the tiered monitoring pipeline:
   export TYPESAFE_API_KEY="your_key_here"
   python3 run_monitor.py
 
-7. TROUBLESHOOTING
+8. TROUBLESHOOTING
 ------------------
 Run the self-healing diagnostic suite:
   ./install.sh --doctor
 
-Check repository constraint compliance (silent failure redirection,
-direct process-module runners in Python, in-place stream editing,
-errexit, disallowed exit codes):
+Check repository constraint compliance:
   ./scripts/check_constraints.sh
 
 The diagnostics check and repair:
   - TUN device availability
   - eBPF / debugfs mounts
-  - Tor hidden service permissions
+  - Tor hidden service permissions (distro-aware user)
   - Nebula PKI validity
   - Ollama daemon and model presence
   - TypeSafe API key configuration
   - Python environment integrity
+  - firewalld rules (Fedora only)
 
-8. SERVICE MANAGEMENT
+9. SERVICE MANAGEMENT
 ---------------------
 All services are deployed and enabled automatically by install.sh:
   systemctl status nebula.service socat-tor.service ebpf_exporter.service prometheus.service
 
-9. SECURITY NOTES
------------------
+10. SECURITY NOTES
+------------------
 - Never keep ca.key on client nodes or the lighthouse
 - Use chmod 600 on all private keys
 - Bind Prometheus and exporters to 127.0.0.1 only
 - Enable BPF JIT hardening via /etc/sysctl.d/99-bpf-hardening.conf
-- Run Tor under its dedicated debian-tor user
+- Run Tor under its dedicated system user (debian-tor on Debian, tor on Fedora)
