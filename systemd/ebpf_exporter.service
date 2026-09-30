@@ -1,0 +1,18 @@
+[Unit]
+Description=eBPF Kernel Metrics Exporter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ebpf_exporter --web.listen-address=127.0.0.1:9435
+Restart=always
+RestartSec=5s
+
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_NET_ADMIN
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

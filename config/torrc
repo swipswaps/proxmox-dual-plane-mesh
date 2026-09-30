@@ -1,0 +1,13 @@
+# Tor v3 Rendezvous Hardened Configuration
+DataDirectory /var/lib/tor
+PidFile /run/tor/tor.pid
+RunAsDaemon 0
+SafeLogging 1
+Log notice sysout
+
+# Tor SOCKS Proxy (Local Loopback Only)
+SocksPort 127.0.0.1:9050
+
+# Hidden Service Rendezvous Channel
+HiddenServiceDir /var/lib/tor/hidden_service/
+HiddenServicePort 4242 127.0.0.1:4242

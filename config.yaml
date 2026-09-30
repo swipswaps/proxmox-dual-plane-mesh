@@ -1,0 +1,20 @@
+# Escalation Monitoring & Automatic Recovery Configuration
+
+tier1:
+  semgrep_config: "auto"
+  local_model: "llama3.2"
+  ollama_host: "http://localhost:11434"
+  confidence_threshold: 0.70
+
+tier2_jev:
+  api_key_env_var: "TYPESAFE_API_KEY"
+  base_url: "https://api.typesafe.ai/v1"
+  model_version: "typesafe:jev-1.13.0"
+  verification_threshold: 0.85
+
+recovery:
+  auto_remediate_low_risk: true
+  max_context_bytes: 32000
+
+dedup_ttl_seconds: 300
+execution_timeout_seconds: 15

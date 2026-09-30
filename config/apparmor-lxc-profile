@@ -1,0 +1,17 @@
+#include <tunables/global>
+
+profile lxc-nebula-telemetry flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/lxc/start-container>
+
+  capability net_admin,
+  capability net_bind_service,
+  capability bpf,
+  capability perfmon,
+  capability sys_ptrace,
+
+  file /dev/net/tun rw,
+  file /sys/kernel/debug/tracing/ r,
+  file /sys/kernel/debug/tracing/** r,
+  file /sys/fs/bpf/ rw,
+  file /sys/fs/bpf/** rw,
+}

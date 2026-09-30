@@ -1,0 +1,56 @@
+pki:
+  ca: /etc/nebula/ca.crt
+  cert: /etc/nebula/host.crt
+  key: /etc/nebula/host.key
+
+static_host_map:
+  "10.100.0.1": ["lighthouse.example.com:4242"]
+
+lighthouse:
+  am_lighthouse: false
+  interval: 10
+  hosts:
+    - "10.100.0.1"
+
+listen:
+  host: 0.0.0.0
+  port: 4242
+
+punchy:
+  punch: true
+  respond: true
+
+# Fast re-resolution: survives dynamic DNS IP rotation on the lighthouse.
+handshakes:
+  try_interval: 100ms
+  query_interval: 5s
+
+tun:
+  dev: nebula0
+  drop_local_broadcast: true
+  drop_multicast: true
+  tx_queue: 500
+  mtu: 1300
+
+logging:
+  level: info
+  format: text
+
+firewall:
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
+
+  outbound:
+    - port: any
+      proto: any
+      host: any
+
+  inbound:
+    - port: any
+      proto: icmp
+      host: any
+    - port: 5201
+      proto: tcp
+      host: any
