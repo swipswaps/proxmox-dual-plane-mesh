@@ -871,7 +871,7 @@ setup_node_environment() {
     fi
 
     local HOSTNAME_SHORT
-    HOSTNAME_SHORT="$(hostname -s 2>/dev/null || echo node)"
+    HOSTNAME_SHORT="$(hostname -s || echo node)"
 
     if [[ "${ACTION_CHOICE}" == "1" ]]; then
         ask_default "Enter Node Name" "lighthouse-01" NODE_NAME

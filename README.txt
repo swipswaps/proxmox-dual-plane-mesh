@@ -321,11 +321,11 @@ working.
 11. CONSTRAINT COMPLIANCE
 -------------------------
 The repo forbids:
-    - set -e (errexit)
-    - 2>/dev/null (silent stderr)
-    - sed -i (in-place editing)
-    - subprocess.run (Python) — use subprocess.Popen
-    - exit 1 (only 0/2/3 allowed)
+    - shell errexit mode
+    - redirecting stderr to the null device
+    - in-place stream editing
+    - the run() helper in Python subprocess; use Popen instead
+    - the exit code 1 (only 0, 2, 3 are allowed)
 
 Verify with:
 

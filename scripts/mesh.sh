@@ -18,17 +18,12 @@
 # Exit codes: 0 success, 2 recoverable failure, 3 usage error.
 #
 # Citations:
-#   RFC 6349 (TCP throughput methodology)
-#     https://www.rfc-editor.org/rfc/rfc6349.html
-#   RFC 5357 (Two-Way Active Measurement Protocol)
-#     https://www.rfc-editor.org/rfc/rfc5357.html
-#   RFC 4656 (One-Way Active Measurement Protocol)
-#     https://www.rfc-editor.org/rfc/rfc4656.html
-#   RFC 768  (UDP)
-#     https://www.rfc-editor.org/rfc/rfc768.html
-#   RFC 8085 (UDP Usage Guidelines)
-#     https://www.rfc-editor.org/rfc/rfc8085.html
-#   NIST SP 800-77 Rev 1 (IPsec VPNs)
+#   RFC 6349 https://www.rfc-editor.org/rfc/rfc6349.html
+#   RFC 5357 https://www.rfc-editor.org/rfc/rfc5357.html
+#   RFC 4656 https://www.rfc-editor.org/rfc/rfc4656.html
+#   RFC 768  https://www.rfc-editor.org/rfc/rfc768.html
+#   RFC 8085 https://www.rfc-editor.org/rfc/rfc8085.html
+#   NIST SP 800-77 Rev 1
 #     https://csrc.nist.gov/publications/detail/sp/800-77/rev-1/final
 # ==============================================================================
 set -uo pipefail
@@ -47,8 +42,22 @@ REPO_ROOT="$(dirname "${SELF_DIR}")"
 OFFER_ROOT="/var/lib/mesh-onboard/offers"
 NEBULA_CONF="/etc/nebula/config.yml"
 
+# Cleanup paths tracked at the top level so the trap can see them even
+# after a function returns. This avoids the "local var goes out of scope
+# before EXIT trap fires" bug.
+CLEANUP_PATHS=()
+
+cleanup_add()   { CLEANUP_PATHS+=("$1"); }
+cleanup_run()   {
+    local p
+    for p in "${CLEANUP_PATHS[@]:-}"; do
+        [[ -e "${p}" ]] && rm -rf "${p}" || true
+    done
+}
+trap cleanup_run EXIT
+
 # --------------------------------------------------------------------------
-# Utility functions
+# Utility
 # --------------------------------------------------------------------------
 
 die_usage() { log_err "$1"; exit 3; }
@@ -60,7 +69,6 @@ need_root() {
         log_err "Try: sudo $0 $*"
         exit 3
     fi
-    # Cache sudo credentials once so nothing else prompts.
     sudo -v || { log_err "cannot acquire sudo"; exit 3; }
 }
 
@@ -107,7 +115,7 @@ detect_lan_ip() {
 }
 
 detect_public_ip() {
-    local ip=""
+    local ip="" url
     for url in ifconfig.me icanhazip.com api.ipify.org; do
         if ip="$(curl -fsS --max-time 4 "https://${url}")"; then
             [[ -n "${ip}" ]] && break
@@ -118,12 +126,11 @@ detect_public_ip() {
 
 detect_mesh_ip() {
     local ip
-    ip="$(ip -brief addr show nebula0 2>/dev/null | awk '{print $3; exit}')"
+    ip="$(ip -brief addr show nebula0 | awk '{print $3; exit}')"
     ip="${ip%%/*}"
     echo "${ip:-10.100.0.1}"
 }
 
-# RFC 1918 + CGNAT detection
 is_cgnat() {
     local ip="$1"
     [[ "${ip}" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-2][0-7])\. ]] && return 0
@@ -131,8 +138,10 @@ is_cgnat() {
 }
 
 # --------------------------------------------------------------------------
-# SSH ControlMaster: one password prompt, then no more
+# SSH ControlMaster: one password prompt
 # --------------------------------------------------------------------------
+
+MESH_SSH_CTL=""
 
 setup_ssh_ctl() {
     local user="$1" host="$2" port="${3:-22}"
@@ -142,16 +151,12 @@ setup_ssh_ctl() {
     MESH_SSH_CTL="${ctl_dir}/mesh-${user}-${host}-${port}"
     export MESH_SSH_CTL
 
-    # If a master is already alive, reuse it
     if ssh -o "ControlPath=${MESH_SSH_CTL}" -O check "${user}@${host}" 2>&1 | grep -q 'Master running'; then
         log_info "Reusing existing SSH control master."
         return 0
     fi
 
     log_step "Establishing SSH control master (single password prompt)"
-    # StrictHostKeyChecking=accept-new removes the fingerprint yes/no prompt.
-    # ControlPersist keeps the connection alive for 5 minutes so scp and any
-    # subsequent ssh calls reuse the same authenticated session.
     if ! ssh -o "ControlMaster=yes" \
              -o "ControlPath=${MESH_SSH_CTL}" \
              -o "ControlPersist=300" \
@@ -166,13 +171,13 @@ setup_ssh_ctl() {
 
 teardown_ssh_ctl() {
     local user="$1" host="$2" port="${3:-22}"
-    if [[ -n "${MESH_SSH_CTL:-}" ]]; then
+    if [[ -n "${MESH_SSH_CTL}" ]]; then
         ssh -o "ControlPath=${MESH_SSH_CTL}" -O exit "${user}@${host}" >/dev/null 2>&1 || true
     fi
 }
 
 # --------------------------------------------------------------------------
-# Command: onboard (Lighthouse)
+# onboard
 # --------------------------------------------------------------------------
 
 cmd_onboard() {
@@ -217,7 +222,7 @@ cmd_onboard() {
     local stage
     stage="$(mktemp -d)" || die_fail "mktemp failed"
     chmod 700 "${stage}"
-    trap 'rm -rf "${stage}"' EXIT
+    cleanup_add "${stage}"
 
     log_step "Signing certificate"
     nebula-cert sign \
@@ -242,7 +247,7 @@ GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ENVEOF
 
     mkdir -p "${OFFER_ROOT}" || die_fail "mkdir ${OFFER_ROOT} failed"
-    chown "root:$(detect_operator_user)" "${OFFER_ROOT}" 2>&1 >/dev/null || true
+    chown "root:$(detect_operator_user)" "${OFFER_ROOT}" || true
     chmod 750 "${OFFER_ROOT}" || true
 
     local bundle_tgz="${OFFER_ROOT}/${name}.tar.gz"
@@ -268,27 +273,27 @@ ENVEOF
     log_bold "Client command — pick ONE:"
     echo ""
     echo -e "${CYAN}[A] Same-LAN, one command:${NC}"
-    echo "  sudo $(basename "$0") join-from ${op_user}@${lan_ip:-<lighthouse-lan>} ${name}"
+    echo "  sudo ./scripts/mesh.sh join-from ${op_user}@${lan_ip:-<lighthouse-lan>} ${name}"
     echo ""
     echo -e "${CYAN}[B] Local file (scp the bundle first):${NC}"
     echo "  scp ${op_user}@${lan_ip:-<lighthouse>}:${bundle_tgz} ~/${name}.tar.gz"
-    echo "  sudo $(basename "$0") join ~/${name}.tar.gz"
+    echo "  sudo ./scripts/mesh.sh join ~/${name}.tar.gz"
     echo ""
     echo -e "${CYAN}[C] Copy-paste base64 (no network path needed):${NC}"
     echo "  cat ${bundle_b64}"
     echo "  # then on the client:"
-    echo "  sudo $(basename "$0") join-b64 '<paste>'"
+    echo "  sudo ./scripts/mesh.sh join-b64 '<paste>'"
     echo ""
     log_bold "Verify immediately with:"
-    echo "  sudo $(basename "$0") verify"
+    echo "  sudo ./scripts/mesh.sh verify"
     echo ""
     log_bold "Shred the bundle after the client has joined:"
-    echo "  sudo $(basename "$0") shred ${name}"
+    echo "  sudo ./scripts/mesh.sh shred ${name}"
     echo ""
 }
 
 # --------------------------------------------------------------------------
-# Command: join (Client)
+# join
 # --------------------------------------------------------------------------
 
 join_from_bundle() {
@@ -298,7 +303,7 @@ join_from_bundle() {
     local extract
     extract="$(mktemp -d)"
     chmod 700 "${extract}"
-    trap 'rm -rf "${extract}"' EXIT
+    cleanup_add "${extract}"
 
     log_step "Extracting bundle"
     tar -xzf "${bundle_path}" -C "${extract}" \
@@ -316,7 +321,6 @@ join_from_bundle() {
     log_info "Node IP    : ${NODE_IP}"
     log_info "Lighthouse : ${LIGHTHOUSE_MESH}"
 
-    # Choose address: prefer LAN if reachable, else public.
     local use=""
     if [[ -n "${LIGHTHOUSE_LAN:-}" ]] && ip route get "${LIGHTHOUSE_LAN}" >/dev/null 2>&1; then
         use="${LIGHTHOUSE_LAN}"
@@ -433,8 +437,8 @@ CFGEOF
     echo "  Lighthouse  : ${LIGHTHOUSE_MESH} via ${use}"
     echo ""
     log_bold "Next:"
-    echo "  sudo $(basename "$0") verify ${LIGHTHOUSE_MESH%%/*}"
-    echo "  sudo $(basename "$0") latency ${LIGHTHOUSE_MESH%%/*}"
+    echo "  sudo ./scripts/mesh.sh verify ${LIGHTHOUSE_MESH%%/*}"
+    echo "  sudo ./scripts/mesh.sh latency ${LIGHTHOUSE_MESH%%/*}"
     echo ""
 }
 
@@ -449,9 +453,9 @@ cmd_join_b64() {
     [[ $# -ge 1 ]] || die_usage "usage: $0 join-b64 '<base64-string>'"
     local tmp
     tmp="$(mktemp --suffix=.tar.gz)"
+    cleanup_add "${tmp}"
     printf '%s' "$1" | base64 -d > "${tmp}" || die_fail "base64 decode failed"
     join_from_bundle "${tmp}"
-    rm -f "${tmp}"
 }
 
 cmd_join_b64_file() {
@@ -460,9 +464,9 @@ cmd_join_b64_file() {
     [[ -f "$1" ]] || die_fail "not a file: $1"
     local tmp
     tmp="$(mktemp --suffix=.tar.gz)"
+    cleanup_add "${tmp}"
     tr -d '\n\r \t' < "$1" | base64 -d > "${tmp}" || die_fail "base64 decode failed"
     join_from_bundle "${tmp}"
-    rm -f "${tmp}"
 }
 
 cmd_join_from() {
@@ -470,7 +474,7 @@ cmd_join_from() {
     [[ $# -ge 1 ]] || die_usage "usage: $0 join-from <user@host> [node-name]"
 
     local spec="$1"
-    local name="${2:-$(hostname -s 2>/dev/null || echo client)}"
+    local name="${2:-$(hostname -s || echo client)}"
     local ssh_user host port
     ssh_user="${spec%%@*}"
     host="${spec#*@}"
@@ -487,6 +491,7 @@ cmd_join_from() {
     local remote_bundle="${OFFER_ROOT}/${name}.tar.gz"
     local local_bundle
     local_bundle="$(mktemp --suffix=.tar.gz)"
+    cleanup_add "${local_bundle}"
 
     log_step "Retrieving ${ssh_user}@${host}:${remote_bundle}"
     scp -o "ControlPath=${MESH_SSH_CTL}" \
@@ -496,11 +501,10 @@ cmd_join_from() {
     teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
 
     join_from_bundle "${local_bundle}"
-    rm -f "${local_bundle}"
 }
 
 # --------------------------------------------------------------------------
-# Command: shred (Lighthouse)
+# shred
 # --------------------------------------------------------------------------
 
 cmd_shred() {
@@ -513,12 +517,12 @@ cmd_shred() {
     local found=0
 
     if [[ -f "${tgz}" ]]; then
-        shred -u "${tgz}" 2>/dev/null || rm -f "${tgz}"
+        shred -u "${tgz}" || rm -f "${tgz}"
         log_info "shredded ${tgz}"
         found=1
     fi
     if [[ -f "${b64}" ]]; then
-        shred -u "${b64}" 2>/dev/null || rm -f "${b64}"
+        shred -u "${b64}" || rm -f "${b64}"
         log_info "shredded ${b64}"
         found=1
     fi
@@ -531,7 +535,7 @@ cmd_shred() {
 }
 
 # --------------------------------------------------------------------------
-# Command: verify
+# verify
 # --------------------------------------------------------------------------
 
 cmd_verify() {
@@ -571,7 +575,7 @@ cmd_verify() {
 
     log_step "PKI"
     if [[ -f /etc/nebula/host.crt ]]; then
-        /usr/local/bin/nebula-cert print -path /etc/nebula/host.crt 2>&1 | grep -E 'Name:|Ips:|Groups:' || true
+        /usr/local/bin/nebula-cert print -path /etc/nebula/host.crt | grep -E 'Name:|Ips:|Groups:' || true
     else
         log_err "no host certificate"
         errors=$((errors + 1))
@@ -600,7 +604,7 @@ cmd_verify() {
 }
 
 # --------------------------------------------------------------------------
-# Command: latency
+# latency
 # --------------------------------------------------------------------------
 
 cmd_latency() {
@@ -611,7 +615,7 @@ cmd_latency() {
 }
 
 # --------------------------------------------------------------------------
-# Command: audit
+# audit
 # --------------------------------------------------------------------------
 
 cmd_audit() {
@@ -631,13 +635,21 @@ cmd_audit() {
 }
 
 # --------------------------------------------------------------------------
-# Command: update
+# update
 # --------------------------------------------------------------------------
 
 cmd_update() {
     log_step "Checking repository state"
     if [[ ! -d "${REPO_ROOT}/.git" ]]; then
-        die_fail "not a git checkout: ${REPO_ROOT}"
+        log_err "${REPO_ROOT} is not a git checkout."
+        log_err ""
+        log_err "For a first-time setup, clone the repo instead:"
+        log_err "  git clone https://github.com/swipswaps/proxmox-dual-plane-mesh.git ~/proxmox-dual-plane-mesh"
+        log_err "  cd ~/proxmox-dual-plane-mesh"
+        log_err "  sudo ./install.sh"
+        log_err ""
+        log_err "After that, 'mesh.sh update' will work."
+        exit 2
     fi
 
     cd "${REPO_ROOT}"
