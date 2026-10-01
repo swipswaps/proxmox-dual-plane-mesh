@@ -10,7 +10,8 @@
 #   join-from <user@host> [name]   Client: fetch bundle over SSH, then join
 #   shred <name>                   Lighthouse: destroy a bundle
 #   verify [peer-ip]               Both: verify mesh health with evidence
-#   latency [peer-ip]              Both: RFC 6349/5357 latency audit
+#   latency [peer-ip] [--peer-ssh user@host]
+#                                  Both: RFC 6349/5357 latency audit
 #   audit                          Both: constraints + diagnostics
 #   update                         Both: safe repo update
 #   help                           Show usage
@@ -42,11 +43,7 @@ REPO_ROOT="$(dirname "${SELF_DIR}")"
 OFFER_ROOT="/var/lib/mesh-onboard/offers"
 NEBULA_CONF="/etc/nebula/config.yml"
 
-# Cleanup paths tracked at the top level so the trap can see them even
-# after a function returns. This avoids the "local var goes out of scope
-# before EXIT trap fires" bug.
 CLEANUP_PATHS=()
-
 cleanup_add()   { CLEANUP_PATHS+=("$1"); }
 cleanup_run()   {
     local p
@@ -138,7 +135,7 @@ is_cgnat() {
 }
 
 # --------------------------------------------------------------------------
-# SSH ControlMaster: one password prompt
+# SSH ControlMaster
 # --------------------------------------------------------------------------
 
 MESH_SSH_CTL=""
@@ -500,6 +497,14 @@ cmd_join_from() {
 
     teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
 
+    # Record the peer SSH target so latency-audit.sh can reuse it
+    if [[ -n "${ssh_user}" ]] && [[ -n "${host}" ]]; then
+        mkdir -p /etc/nebula
+        echo "${ssh_user}@${host}" > /etc/nebula/lighthouse-ssh
+        chmod 600 /etc/nebula/lighthouse-ssh
+        log_info "Recorded peer SSH target in /etc/nebula/lighthouse-ssh"
+    fi
+
     join_from_bundle "${local_bundle}"
 }
 
@@ -535,7 +540,7 @@ cmd_shred() {
 }
 
 # --------------------------------------------------------------------------
-# verify
+# verify — full certificate dump
 # --------------------------------------------------------------------------
 
 cmd_verify() {
@@ -575,7 +580,10 @@ cmd_verify() {
 
     log_step "PKI"
     if [[ -f /etc/nebula/host.crt ]]; then
-        /usr/local/bin/nebula-cert print -path /etc/nebula/host.crt | grep -E 'Name:|Ips:|Groups:' || true
+        # Show the full certificate. The print output is a YAML-like
+        # multi-line structure with fields on subsequent lines; a simple
+        # grep collapses the values onto the field line and loses them.
+        /usr/local/bin/nebula-cert print -path /etc/nebula/host.crt || log_warn "cert print failed"
     else
         log_err "no host certificate"
         errors=$((errors + 1))
@@ -604,14 +612,30 @@ cmd_verify() {
 }
 
 # --------------------------------------------------------------------------
-# latency
+# latency — delegates to latency-audit.sh, passes --peer-ssh if recorded
 # --------------------------------------------------------------------------
 
 cmd_latency() {
     need_root "$@"
-    local peer="${1:-$(detect_mesh_ip)}"
+
+    local peer=""
+    local extra=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --peer-ssh) extra+=(--peer-ssh "$2"); shift 2 ;;
+            --no-auto-server) extra+=(--no-auto-server); shift ;;
+            --keep-server) extra+=(--keep-server); shift ;;
+            --duration) extra+=(--duration "$2"); shift 2 ;;
+            -*) log_warn "ignoring unknown flag: $1"; shift ;;
+            *)  [[ -z "${peer}" ]] && peer="$1"; shift ;;
+        esac
+    done
+
+    [[ -z "${peer}" ]] && peer="$(detect_mesh_ip)"
     [[ -x "${SELF_DIR}/latency-audit.sh" ]] || die_fail "latency-audit.sh not found or not executable"
-    exec "${SELF_DIR}/latency-audit.sh" "${peer}"
+
+    exec "${SELF_DIR}/latency-audit.sh" "${peer}" "${extra[@]:-}"
 }
 
 # --------------------------------------------------------------------------
@@ -689,16 +713,11 @@ Commands:
   join-from <user@host> [name]      Client: fetch bundle over SSH, then join
   shred <name>                      Lighthouse: destroy a bundle
   verify [peer-ip]                  Both: verify mesh health with evidence
-  latency [peer-ip]                 Both: RFC 6349/5357 latency audit
+  latency [peer-ip] [--peer-ssh u@h]
+                                    Both: RFC 6349/5357 latency audit
   audit                             Both: constraints + diagnostics
   update                            Both: safe repo update
   help                              This message
-
-Examples:
-  sudo ./scripts/mesh.sh onboard fedora
-  sudo ./scripts/mesh.sh join-from owner@192.168.1.160 fedora
-  sudo ./scripts/mesh.sh verify 10.100.0.1
-  sudo ./scripts/mesh.sh latency 10.100.0.1
 USAGEEOF
 }
 
