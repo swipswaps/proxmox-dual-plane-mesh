@@ -667,6 +667,7 @@ cmd_latency() {
             --no-auto-server) extra+=(--no-auto-server); shift ;;
             --keep-server) extra+=(--keep-server); shift ;;
             --duration) extra+=(--duration "$2"); shift 2 ;;
+            --udp-rate) extra+=(--udp-rate "$2"); shift 2 ;;
             -*) log_warn "ignoring unknown flag: $1"; shift ;;
             *)  [[ -z "${peer}" ]] && peer="$1"; shift ;;
         esac

@@ -47,6 +47,7 @@ PEER_SSH=""
 AUTO_SERVER=1
 KEEP_SERVER=0
 DURATION=30
+UDP_RATE="100M"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +55,7 @@ while [[ $# -gt 0 ]]; do
         --no-auto-server)   AUTO_SERVER=0; shift ;;
         --keep-server)      KEEP_SERVER=1; shift ;;
         --duration)         DURATION="$2"; shift 2 ;;
+        --udp-rate)         UDP_RATE="$2"; shift 2 ;;
         --help|-h)
             cat << USAGEEOF
 Usage: sudo latency-audit.sh [peer-ip] [options]
@@ -63,6 +65,7 @@ Options:
   --no-auto-server         Do not attempt to start iperf3 on peer
   --keep-server            Leave iperf3 server running on peer after test
   --duration N             Seconds per phase (default: 30)
+  --udp-rate RATE          UDP target rate, e.g. 20M or 100M (default: 100M)
 USAGEEOF
             exit 0
             ;;
@@ -222,7 +225,7 @@ run_fping() {
 
 run_iperf3_udp() {
     log_step "Phase 3/4 — UDP jitter/loss (iperf3, ${DURATION}s, 5s warm-up omitted)"
-    echo "  Command: iperf3 -c ${PEER} -u -b 100M -t ${DURATION} -O 5"
+    echo "  Command: iperf3 -c ${PEER} -u -b ${UDP_RATE} -t ${DURATION} -O 5"
     echo "  References:"
     echo "    RFC 6349 §4      https://www.rfc-editor.org/rfc/rfc6349.html"
     echo "    RFC 8085 §3.1.3  https://www.rfc-editor.org/rfc/rfc8085.html"
@@ -230,17 +233,22 @@ run_iperf3_udp() {
     echo ""
     if ! command -v iperf3 >/dev/null; then
         log_warn "iperf3 not installed; run manually:"
-        echo "  iperf3 -c ${PEER} -u -b 100M -t ${DURATION} -O 5"
+        echo "  iperf3 -c ${PEER} -u -b ${UDP_RATE} -t ${DURATION} -O 5"
         return 1
+    fi
+    # Restart server to guarantee it is in a clean single-test state.
+    if [[ -n "${PEER_SSH}" ]]; then
+        stop_server_remote "${PEER_SSH}" >/dev/null
+        start_server_remote "${PEER_SSH}" || {
+            log_warn "could not start iperf3 server"
+            return 1
+        }
     fi
     if ! server_probe; then
         log_warn "no iperf3 server on ${PEER}"
-        echo ""
-        echo "  On the peer, start: iperf3 -s -D"
-        echo "  Or re-run with: sudo latency-audit.sh ${PEER} --peer-ssh user@host"
         return 1
     fi
-    iperf3 -c "${PEER}" -u -b 100M -t "${DURATION}" -O 5 || return 2
+    iperf3 -c "${PEER}" -u -b "${UDP_RATE}" -t "${DURATION}" -O 5 || return 2
     return 0
 }
 
@@ -253,6 +261,14 @@ run_iperf3_tcp() {
         log_warn "iperf3 not installed; run manually:"
         echo "  iperf3 -c ${PEER} -t ${DURATION} -O 5"
         return 1
+    fi
+    # Restart server again; the UDP phase already consumed the previous one.
+    if [[ -n "${PEER_SSH}" ]]; then
+        stop_server_remote "${PEER_SSH}" >/dev/null
+        start_server_remote "${PEER_SSH}" || {
+            log_warn "could not start iperf3 server"
+            return 1
+        }
     fi
     if ! server_probe; then
         log_warn "no iperf3 server on ${PEER}"
