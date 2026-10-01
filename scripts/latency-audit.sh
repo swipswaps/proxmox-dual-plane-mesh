@@ -138,10 +138,24 @@ start_server_remote() {
     user="${spec%%@*}"
     host="${spec#*@}"
 
+    # SSH to the peer as the invoking user, not root. The key installed
+    # by ssh-copy-id lives in the invoking user's ~/.ssh/, so that is who
+    # must run ssh for the key to be found. sudo -u as root to that user
+    # does not prompt and does not require a password.
+    local ssh_as=""
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+        ssh_as="${SUDO_USER}"
+    fi
+
     log_step "Starting iperf3 server on ${spec}"
-    if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-           "${user}@${host}" "command -v iperf3 >/dev/null && (pgrep -x iperf3 >/dev/null || (nohup iperf3 -s -D >/dev/null 2>&1 && sleep 1)) && true"; then
-        # Probe again
+    local ssh_cmd
+    if [[ -n "${ssh_as}" ]]; then
+        ssh_cmd=(sudo -u "${ssh_as}" -H ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+    else
+        ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+    fi
+
+    if "${ssh_cmd[@]}" "${user}@${host}" "command -v iperf3 >/dev/null && (pgrep -x iperf3 >/dev/null || (nohup iperf3 -s -D >/dev/null 2>&1 && sleep 1)) && true"; then
         sleep 1
         if server_probe; then
             log_info "iperf3 server on peer is now reachable."
@@ -160,9 +174,21 @@ stop_server_remote() {
     local user host
     user="${spec%%@*}"
     host="${spec#*@}"
+
+    local ssh_as=""
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+        ssh_as="${SUDO_USER}"
+    fi
+
     log_step "Stopping iperf3 server on ${spec}"
-    ssh -o BatchMode=yes -o ConnectTimeout=5 "${user}@${host}" \
-        "pkill -x iperf3 >/dev/null 2>&1 || true" || log_warn "could not stop server"
+    local ssh_cmd
+    if [[ -n "${ssh_as}" ]]; then
+        ssh_cmd=(sudo -u "${ssh_as}" -H ssh -o BatchMode=yes -o ConnectTimeout=5)
+    else
+        ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=5)
+    fi
+
+    "${ssh_cmd[@]}" "${user}@${host}" "pkill -x iperf3 || true" || log_warn "could not stop server"
     return 0
 }
 

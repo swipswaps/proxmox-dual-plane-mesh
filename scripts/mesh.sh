@@ -142,19 +142,44 @@ MESH_SSH_CTL=""
 
 setup_ssh_ctl() {
     local user="$1" host="$2" port="${3:-22}"
-    local ctl_dir="${HOME}/.ssh/cm"
+
+    # Build the ctl directory inside the invoking user's home, not root's.
+    # This is what makes the socket path reachable when the control master
+    # is created under the invoking user via sudo -u.
+    local home_dir
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+        home_dir="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+    fi
+    [[ -z "${home_dir}" ]] && home_dir="${HOME}"
+
+    local ctl_dir="${home_dir}/.ssh/cm"
     mkdir -p "${ctl_dir}" || true
     chmod 700 "${ctl_dir}" || true
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+        chown "${SUDO_USER}:${SUDO_USER}" "${ctl_dir}" || true
+    fi
     MESH_SSH_CTL="${ctl_dir}/mesh-${user}-${host}-${port}"
     export MESH_SSH_CTL
 
-    if ssh -o "ControlPath=${MESH_SSH_CTL}" -O check "${user}@${host}" 2>&1 | grep -q 'Master running'; then
+    local ssh_as=""
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+        ssh_as="${SUDO_USER}"
+    fi
+
+    local ssh_prefix
+    if [[ -n "${ssh_as}" ]]; then
+        ssh_prefix=(sudo -u "${ssh_as}" -H ssh)
+    else
+        ssh_prefix=(ssh)
+    fi
+
+    if "${ssh_prefix[@]}" -o "ControlPath=${MESH_SSH_CTL}" -O check "${user}@${host}" 2>&1 | grep -q 'Master running'; then
         log_info "Reusing existing SSH control master."
         return 0
     fi
 
     log_step "Establishing SSH control master (single password prompt)"
-    if ! ssh -o "ControlMaster=yes" \
+    if ! "${ssh_prefix[@]}" -o "ControlMaster=yes" \
              -o "ControlPath=${MESH_SSH_CTL}" \
              -o "ControlPersist=300" \
              -o "StrictHostKeyChecking=accept-new" \
@@ -168,7 +193,16 @@ setup_ssh_ctl() {
 
 teardown_ssh_ctl() {
     local user="$1" host="$2" port="${3:-22}"
-    if [[ -n "${MESH_SSH_CTL}" ]]; then
+    if [[ -z "${MESH_SSH_CTL}" ]]; then
+        return 0
+    fi
+    local ssh_as=""
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+        ssh_as="${SUDO_USER}"
+    fi
+    if [[ -n "${ssh_as}" ]]; then
+        sudo -u "${ssh_as}" -H ssh -o "ControlPath=${MESH_SSH_CTL}" -O exit "${user}@${host}" >/dev/null 2>&1 || true
+    else
         ssh -o "ControlPath=${MESH_SSH_CTL}" -O exit "${user}@${host}" >/dev/null 2>&1 || true
     fi
 }
@@ -491,7 +525,13 @@ cmd_join_from() {
     cleanup_add "${local_bundle}"
 
     log_step "Retrieving ${ssh_user}@${host}:${remote_bundle}"
-    scp -o "ControlPath=${MESH_SSH_CTL}" \
+    local scp_prefix
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+        scp_prefix=(sudo -u "${SUDO_USER}" -H scp)
+    else
+        scp_prefix=(scp)
+    fi
+    "${scp_prefix[@]}" -o "ControlPath=${MESH_SSH_CTL}" \
         "${ssh_user}@${host}:${remote_bundle}" "${local_bundle}" \
         || { teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"; die_fail "scp failed"; }
 

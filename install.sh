@@ -1049,14 +1049,30 @@ SVCEOF
         exit 2
     }
 
-    if command -v pipx >/dev/null; then
-        pipx install --force pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
-        pipx install pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
-        log_warn "pipx install reported errors"
+    # Create a virtual environment in the repo and install Python
+    # dependencies there. This avoids the pipx single-package limitation
+    # and the system-Python PEP 668 restrictions.
+    #
+    # References:
+    #   PEP 668 — Marking Python base environments as externally managed
+    #     https://peps.python.org/pep-0668/
+    #   Python venv documentation
+    #     https://docs.python.org/3/library/venv.html
+    local venv_dir="${REPO_ROOT}/.venv"
+    if [[ ! -d "${venv_dir}" ]]; then
+        log_info "Creating Python virtual environment at ${venv_dir}"
+        python3 -m venv "${venv_dir}" || log_warn "venv creation failed"
+    fi
+    if [[ -x "${venv_dir}/bin/pip" ]]; then
+        log_info "Installing Python dependencies into the venv"
+        "${venv_dir}/bin/pip" install --upgrade pip || log_warn "pip upgrade failed"
+        if [[ -f "${REPO_ROOT}/requirements.txt" ]]; then
+            "${venv_dir}/bin/pip" install -r "${REPO_ROOT}/requirements.txt" || log_warn "pip install -r requirements.txt failed"
+        else
+            "${venv_dir}/bin/pip" install pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || log_warn "pip install failed"
+        fi
     else
-        pip3 install --break-system-packages pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
-        pip3 install pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
-        log_warn "pip install reported errors"
+        log_warn "venv pip not available; skipping Python dependency install"
     fi
 
     run_full_diagnostics
