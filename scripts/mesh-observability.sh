@@ -109,14 +109,55 @@ detect_grafana_group() {
 }
 
 pick_free_port() {
+    # Fedora's SELinux policy restricts the grafana_t domain to a fixed
+    # set of ports. Binding to any other port fails with EACCES. Prefer
+    # an already-permitted port; if none is free, extend the policy.
+    local allowed=""
     local p
+    local free=""
+
+    if command -v semanage >/dev/null && command -v getenforce >/dev/null; then
+        if [[ "$(getenforce)" == "Enforcing" ]]; then
+            allowed="$(semanage port -l | awk '/^grafana_port_t/ {print $NF}' | tr -d '[:space:]' | tr ',' '\n')"
+        fi
+    fi
+
+    if [[ -n "${allowed}" ]]; then
+        for p in ${allowed}; do
+            if [[ "${p}" =~ ^[0-9]+$ ]]; then
+                if ! ss -H -lntu | grep -qE "[:.]${p}[[:space:]]"; then
+                    echo "${p}"
+                    return 0
+                fi
+            fi
+        done
+    fi
+
     for p in 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010; do
         if ! ss -H -lntu | grep -qE "[:.]${p}[[:space:]]"; then
-            echo "${p}"
-            return 0
+            free="${p}"
+            break
         fi
     done
-    echo "3000"
+    [[ -z "${free}" ]] && free="3000"
+
+    if command -v semanage >/dev/null && command -v getenforce >/dev/null; then
+        if [[ "$(getenforce)" == "Enforcing" ]]; then
+            if ! semanage port -l | awk '/^grafana_port_t/ {print $NF}' | tr -d '[:space:]' | tr ',' '\n' | grep -qx "${free}"; then
+                log_info "extending SELinux policy to allow Grafana on port ${free}"
+                semanage_out="$(semanage port -a -t grafana_port_t -p tcp "${free}" 2>&1)"
+                if [[ $? -ne 0 ]]; then
+                    semanage_out="$(semanage port -m -t grafana_port_t -p tcp "${free}" 2>&1)"
+                    if [[ $? -ne 0 ]]; then
+                        log_warn "semanage could not add port ${free}: ${semanage_out}"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    echo "${free}"
+    return 0
 }
 
 current_grafana_port() {
