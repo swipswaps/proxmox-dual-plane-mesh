@@ -306,9 +306,46 @@ cmd_grafana() {
         fi
     fi
 
+    # Pick a free port between 3000 and 3010 before starting Grafana,
+    # and write it into grafana.ini. This avoids the "address already in
+    # use" restart loop that occurs when another service holds 3000.
+    local graf_port=""
+    local candidate
+    for candidate in 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010; do
+        if ! ss -H -lntu | grep -qE "[:.]${candidate}[[:space:]]"; then
+            graf_port="${candidate}"
+            break
+        fi
+    done
+    if [[ -z "${graf_port}" ]]; then
+        log_warn "no free port in 3000..3010; leaving Grafana on its default"
+        graf_port=3000
+    fi
+    log_info "selecting Grafana port ${graf_port}"
+    local graf_ini="/etc/grafana/grafana.ini"
+    if [[ -f "${graf_ini}" ]]; then
+        python3 - "${graf_ini}" "${graf_port}" << 'GRAFANA_PORT'
+import sys, re
+path, port = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    text = f.read()
+if re.search(r'^\s*\[server\]', text, re.M):
+    if re.search(r'^\s*http_port\s*=', text, re.M):
+        text = re.sub(r'^\s*http_port\s*=\s*\d+', 'http_port = ' + port, text, flags=re.M)
+    else:
+        text = re.sub(r'(^\s*\[server\])', r'\1\nhttp_port = ' + port, text, count=1, flags=re.M)
+else:
+    text = text.rstrip() + '\n\n[server]\nhttp_port = ' + port + '\n'
+with open(path, "w") as f:
+    f.write(text)
+print("[grafana] set http_port = " + port)
+GRAFANA_PORT
+    fi
+
     log_step "Enabling and starting grafana-server"
+    systemctl reset-failed grafana-server || true
     systemctl enable --now grafana-server || log_warn "enable/start returned non-zero"
-    sleep 2
+    sleep 3
 
     local active http
     active="$(systemctl is-active grafana-server 2>&1)"
@@ -320,12 +357,47 @@ cmd_grafana() {
     echo "  HTTP    : ${http} (http://127.0.0.1:3000/login)"
     echo ""
 
-    # Open firewall if firewalld is active
-    if command -v firewall-cmd >/dev/null; then
-        if systemctl is-active --quiet firewalld; then
-            log_info "opening TCP 3000 in firewalld"
-            firewall-cmd --permanent --add-port=3000/tcp || true
-            firewall-cmd --reload || true
+    # Pick the first free port in 3000..3010 and configure Grafana on it.
+    local graf_port=""
+    local candidate
+    for candidate in 3000 3001 3002 3003 3004 3005 3006 3007 3008 3009 3010; do
+        if ! ss -H -lntu | grep -q ":" + "${candidate}" + " "; then
+            if ! ss -H -lntu | grep -qE "[:.]${candidate}[[:space:]]"; then
+                graf_port="${candidate}"
+                break
+            fi
+        fi
+    done
+    if [[ -z "${graf_port}" ]]; then
+        log_warn "no free port in 3000..3010; leaving Grafana on its default"
+    else
+        log_info "configuring Grafana to listen on port ${graf_port}"
+        local ini="/etc/grafana/grafana.ini"
+        if [[ -f "${ini}" ]]; then
+            python3 - "${ini}" "${graf_port}" << 'GRAFANA_PORT_PATCH'
+import sys, re
+path, port = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    text = f.read()
+if re.search(r'^\s*\[server\]', text, re.M):
+    if re.search(r'^\s*http_port\s*=', text, re.M):
+        text = re.sub(r'^\s*http_port\s*=\s*\d+', 'http_port = ' + port, text, flags=re.M)
+    else:
+        text = re.sub(r'(^\s*\[server\])', r'\1\nhttp_port = ' + port, text, count=1, flags=re.M)
+else:
+    text = text.rstrip() + '\n\n[server]\nhttp_port = ' + port + '\n'
+with open(path, "w") as f:
+    f.write(text)
+print("[grafana] set http_port = " + port)
+GRAFANA_PORT_PATCH
+        fi
+        systemctl restart grafana-server || true
+        if command -v firewall-cmd >/dev/null; then
+            if systemctl is-active --quiet firewalld; then
+                log_info "opening TCP ${graf_port} in firewalld"
+                firewall-cmd --permanent --add-port="${graf_port}/tcp" || true
+                firewall-cmd --reload || true
+            fi
         fi
     fi
 
@@ -339,18 +411,18 @@ cmd_grafana() {
     log_bold "=== Accessing Grafana ==="
     echo ""
     echo "  On this node:"
-    echo "    Open http://127.0.0.1:3000 in a browser."
+    echo "    Open http://127.0.0.1:${graf_port} in a browser."
     echo "    Initial credentials: admin / admin"
     echo ""
     if [[ -n "${lan_ip}" ]]; then
         echo "  From the peer over the LAN (${lan_ip}):"
-        echo "    ssh -L 3000:127.0.0.1:3000 ${SUDO_USER:-user}@${lan_ip}"
-        echo "    then open http://localhost:3000"
+        echo "    ssh -L ${graf_port}:127.0.0.1:${graf_port} ${SUDO_USER:-user}@${lan_ip}"
+        echo "    then open http://localhost:${graf_port}"
         echo ""
     fi
     echo "  From the peer over the mesh (10.100.0.x):"
-    echo "    ssh -L 3000:127.0.0.1:3000 ${SUDO_USER:-user}@10.100.0.1   # or 10.100.0.2"
-    echo "    then open http://localhost:3000"
+    echo "    ssh -L ${graf_port}:127.0.0.1:${graf_port} ${SUDO_USER:-user}@10.100.0.1   # or 10.100.0.2"
+    echo "    then open http://localhost:${graf_port}"
     echo ""
     echo "  Add data source in Grafana:"
     echo "    Connections -> Data Sources -> Prometheus"
@@ -385,11 +457,22 @@ cmd_portability() {
         fi
         if [[ -n "${current}" ]]; then
             echo "Current DDNS hostname: ${current}"
-            read -rp "New DDNS hostname [${current}]: " ddns
-            [[ -z "${ddns}" ]] && ddns="${current}"
+            # Read from /dev/tty so this works when invoked inside a heredoc.
+        if [[ -r /dev/tty ]]; then
+            read -rp "New DDNS hostname [${current}]: " ddns < /dev/tty
         else
-            read -rp "DDNS hostname of the Lighthouse (e.g. lighthouse.example.com): " ddns
+            ddns="${current}"
+            log_warn "no /dev/tty; using current value ${current}"
         fi
+        [[ -z "${ddns}" ]] && ddns="${current}"
+    else
+        if [[ -r /dev/tty ]]; then
+            read -rp "DDNS hostname of the Lighthouse (e.g. lighthouse.example.com): " ddns < /dev/tty
+        else
+            log_err "no /dev/tty and no current hostname; run interactively"
+            exit 3
+        fi
+    fi
     fi
 
     if [[ -z "${ddns}" ]]; then
