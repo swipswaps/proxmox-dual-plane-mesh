@@ -707,16 +707,30 @@ install_nebula_if_missing() {
 # The supported distribution method is the container image on GHCR. This
 # function detects the available container runtime, pulls the pinned image,
 # and writes a systemd unit that runs it with the minimum required
-# capabilities and bindings. Idempotent: skips if the unit is present.
+# capabilities and bindings.
+#
+# Idempotency: if the unit is already the container form, nothing happens.
+# If the unit is the legacy binary form (ExecStart points at a local
+# binary), it is rewritten to the container form and the service is
+# restarted so the fix takes effect immediately.
 # ==============================================================================
 
 EBPF_VERSION="v2.5.1"
 EBPF_IMAGE="ghcr.io/cloudflare/ebpf_exporter:${EBPF_VERSION}"
+EBPF_UNIT="/etc/systemd/system/ebpf_exporter.service"
 
 install_ebpf_exporter_if_missing() {
-    if [[ -f /etc/systemd/system/ebpf_exporter.service ]]; then
-        log_info "ebpf_exporter.service already present; skipping."
-        return 0
+    local rewrite_needed=1
+
+    if [[ -f "${EBPF_UNIT}" ]]; then
+        if grep -q 'podman run\|docker run' "${EBPF_UNIT}"; then
+            log_info "ebpf_exporter.service already uses the container form; skipping."
+            return 0
+        else
+            log_warn "ebpf_exporter.service exists in legacy binary form."
+            log_warn "Migrating it to the container form now."
+            rewrite_needed=0
+        fi
     fi
 
     local RUNTIME=""
@@ -745,10 +759,15 @@ install_ebpf_exporter_if_missing() {
         return 0
     fi
 
+    if (( rewrite_needed == 0 )); then
+        log_info "Stopping existing ebpf_exporter.service before rewriting unit"
+        systemctl stop ebpf_exporter >/dev/null 2>&1 || true
+    fi
+
     log_info "Writing systemd unit for ebpf_exporter container (runtime=${RUNTIME})..."
 
     if [[ "${RUNTIME}" == "podman" ]]; then
-        cat > /etc/systemd/system/ebpf_exporter.service << 'EBPFEOF' || { log_err "ebpf_exporter.service write failed"; return 2; }
+        cat > "${EBPF_UNIT}" << 'EBPFEOF' || { log_err "ebpf_exporter.service write failed"; return 2; }
 [Unit]
 Description=eBPF Kernel Metrics Exporter (container)
 After=network-online.target
@@ -771,7 +790,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EBPFEOF
     else
-        cat > /etc/systemd/system/ebpf_exporter.service << 'EBPFEOF' || { log_err "ebpf_exporter.service write failed"; return 2; }
+        cat > "${EBPF_UNIT}" << 'EBPFEOF' || { log_err "ebpf_exporter.service write failed"; return 2; }
 [Unit]
 Description=eBPF Kernel Metrics Exporter (container)
 After=network-online.target
@@ -797,8 +816,20 @@ EBPFEOF
 
     systemctl daemon-reload || log_warn "daemon-reload after ebpf_exporter unit write failed"
     systemctl enable ebpf_exporter >/dev/null 2>&1 || log_warn "could not enable ebpf_exporter.service"
-    log_info "ebpf_exporter.service installed. It will start on next boot or:"
-    log_info "  systemctl start ebpf_exporter"
+
+    if (( rewrite_needed == 0 )); then
+        log_info "Restarting ebpf_exporter.service with the new unit"
+        systemctl restart ebpf_exporter || log_warn "ebpf_exporter restart failed"
+        sleep 2
+        if systemctl is-active --quiet ebpf_exporter; then
+            log_info "ebpf_exporter.service is active"
+        else
+            log_warn "ebpf_exporter.service is not active; check journalctl -u ebpf_exporter"
+        fi
+    else
+        log_info "ebpf_exporter.service installed. It will start on next boot or:"
+        log_info "  systemctl start ebpf_exporter"
+    fi
     return 0
 }
 
