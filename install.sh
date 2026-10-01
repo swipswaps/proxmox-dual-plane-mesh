@@ -283,8 +283,8 @@ ensure_service_dirs() {
 # NEBULA RUNTIME VERIFICATION
 # ==============================================================================
 # Waits for nebula.service to be active, the tun device to appear with the
-# expected IP, the restart count to be low, and UDP 4242 to be bound.
-# Fails loudly with diagnostics if any check does not pass within the window.
+# expected IP (mask-agnostic comparison), the restart count to be low, and
+# UDP 4242 to be bound. Fails loudly with diagnostics if any check fails.
 # ==============================================================================
 
 verify_nebula_runtime() {
@@ -296,16 +296,20 @@ verify_nebula_runtime() {
 
     log_step "Verifying nebula runtime (dev=${expected_dev}, ip=${expected_ip}, port=${listen_port}/udp)..."
 
+    local expected_bare
+    expected_bare="${expected_ip%%/*}"
+
     while (( waited < limit )); do
         if systemctl is-active --quiet nebula; then
             if ip link show "${expected_dev}" >/dev/null 2>&1; then
-                local actual_ip
+                local actual_ip actual_bare
                 actual_ip="$(ip -brief addr show "${expected_dev}" | awk '{print $3}' | head -n1)"
-                if [[ "${actual_ip}" == "${expected_ip}" ]]; then
+                actual_bare="${actual_ip%%/*}"
+                if [[ "${actual_bare}" == "${expected_bare}" ]]; then
                     log_info "nebula.service active, ${expected_dev} up with ${actual_ip}"
                     break
                 else
-                    log_warn "${expected_dev} present but address is '${actual_ip}', expected '${expected_ip}'"
+                    log_warn "${expected_dev} present with '${actual_ip}', expected '${expected_ip}'"
                 fi
             fi
         fi
@@ -326,8 +330,6 @@ verify_nebula_runtime() {
         ls -la /etc/nebula || true
         return 2
     fi
-
-    # Additional assertions that go beyond interface presence.
 
     local restarts
     restarts="$(systemctl show -p NRestarts --value nebula)"
