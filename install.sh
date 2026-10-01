@@ -88,6 +88,7 @@ pkg_name_for() {
             lsb-release) echo "" ;;
             iproute2) echo "iproute" ;;
             gnupg) echo "gnupg2" ;;
+            podman) echo "podman" ;;
             *) echo "${logical}" ;;
         esac
     else
@@ -282,10 +283,6 @@ ensure_service_dirs() {
 # ==============================================================================
 # NEBULA RUNTIME VERIFICATION
 # ==============================================================================
-# Waits for nebula.service to be active, the tun device to appear with the
-# expected IP (mask-agnostic comparison), the restart count to be low, and
-# UDP 4242 to be bound. Fails loudly with diagnostics if any check fails.
-# ==============================================================================
 
 verify_nebula_runtime() {
     local expected_dev="$1"
@@ -458,8 +455,9 @@ run_full_diagnostics() {
 
     if [[ -n "${TYPESAFE_API_KEY:-}" ]]; then
         log_info "TYPESAFE_API_KEY detected."
-        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TYPESAFE_API_KEY}" "https://api.typesafe.ai/v1/models" || echo "000")
-        log_info "TypeSafe API /v1/models HTTP status: ${HTTP_STATUS}"
+        PROBE_PATH="/v1/models"
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TYPESAFE_API_KEY}" "https://api.typesafe.ai${PROBE_PATH}" || echo "000")
+        log_info "TypeSafe API ${PROBE_PATH} HTTP status: ${HTTP_STATUS}"
     else
         log_warn "TYPESAFE_API_KEY missing!"
         read -rp "Enter your TypeSafe API Key (or Enter to skip): " ENTERED_KEY
@@ -702,21 +700,105 @@ install_nebula_if_missing() {
     return 0
 }
 
+# ==============================================================================
+# eBPF EXPORTER (container-based)
+# ==============================================================================
+# Cloudflare does not publish prebuilt binary tarballs for ebpf_exporter.
+# The supported distribution method is the container image on GHCR. This
+# function detects the available container runtime, pulls the pinned image,
+# and writes a systemd unit that runs it with the minimum required
+# capabilities and bindings. Idempotent: skips if the unit is present.
+# ==============================================================================
+
+EBPF_VERSION="v2.5.1"
+EBPF_IMAGE="ghcr.io/cloudflare/ebpf_exporter:${EBPF_VERSION}"
+
 install_ebpf_exporter_if_missing() {
-    if command -v ebpf_exporter >/dev/null; then
+    if [[ -f /etc/systemd/system/ebpf_exporter.service ]]; then
+        log_info "ebpf_exporter.service already present; skipping."
         return 0
     fi
-    log_info "Fetching ebpf_exporter binary ${EBPF_VER}..."
-    local url="https://github.com/cloudflare/ebpf_exporter/releases/download/${EBPF_VER}/ebpf_exporter-${EBPF_VER}.linux-amd64.tar.gz"
-    if wget -q -O "${TMP_DIR}/ebpf_exporter.tar.gz" "${url}"; then
-        tar -xzf "${TMP_DIR}/ebpf_exporter.tar.gz" -C /usr/local/bin/ || log_warn "ebpf_exporter extract failed"
-        if [[ -f /usr/local/bin/ebpf_exporter-${EBPF_VER}.linux-amd64 ]]; then
-            mv "/usr/local/bin/ebpf_exporter-${EBPF_VER}.linux-amd64" /usr/local/bin/ebpf_exporter
-        fi
-        chmod +x /usr/local/bin/ebpf_exporter || log_warn "chmod ebpf_exporter failed"
+
+    local RUNTIME=""
+    if command -v podman >/dev/null; then
+        RUNTIME="podman"
+    elif command -v docker >/dev/null; then
+        RUNTIME="docker"
     else
-        log_warn "ebpf_exporter download failed; eBPF metrics will be unavailable."
+        log_info "Neither podman nor docker found. Installing podman..."
+        if [[ "${OS_FAMILY}" == "fedora" ]]; then
+            ${PKG_INSTALL} podman || { log_warn "podman install failed; eBPF metrics will be unavailable."; return 0; }
+        else
+            apt-get install -y podman || { log_warn "podman install failed; eBPF metrics will be unavailable."; return 0; }
+        fi
+        if command -v podman >/dev/null; then
+            RUNTIME="podman"
+        else
+            log_warn "podman still unavailable after install; skipping ebpf_exporter."
+            return 0
+        fi
     fi
+
+    log_info "Pulling ${EBPF_IMAGE} via ${RUNTIME}..."
+    if ! ${RUNTIME} pull "${EBPF_IMAGE}"; then
+        log_warn "image pull failed; eBPF metrics will be unavailable."
+        return 0
+    fi
+
+    log_info "Writing systemd unit for ebpf_exporter container (runtime=${RUNTIME})..."
+
+    if [[ "${RUNTIME}" == "podman" ]]; then
+        cat > /etc/systemd/system/ebpf_exporter.service << 'EBPFEOF' || { log_err "ebpf_exporter.service write failed"; return 2; }
+[Unit]
+Description=eBPF Kernel Metrics Exporter (container)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/podman run --rm --name ebpf_exporter \
+    --privileged \
+    --net host \
+    -p 127.0.0.1:9435:9435 \
+    -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+    -v /sys/kernel/debug:/sys/kernel/debug:ro \
+    ghcr.io/cloudflare/ebpf_exporter:v2.5.1 \
+    --config.dir=examples --config.names=timers
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EBPFEOF
+    else
+        cat > /etc/systemd/system/ebpf_exporter.service << 'EBPFEOF' || { log_err "ebpf_exporter.service write failed"; return 2; }
+[Unit]
+Description=eBPF Kernel Metrics Exporter (container)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/docker run --rm --name ebpf_exporter \
+    --privileged \
+    --net host \
+    -p 127.0.0.1:9435:9435 \
+    -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+    -v /sys/kernel/debug:/sys/kernel/debug:ro \
+    ghcr.io/cloudflare/ebpf_exporter:v2.5.1 \
+    --config.dir=examples --config.names=timers
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EBPFEOF
+    fi
+
+    systemctl daemon-reload || log_warn "daemon-reload after ebpf_exporter unit write failed"
+    systemctl enable ebpf_exporter >/dev/null 2>&1 || log_warn "could not enable ebpf_exporter.service"
+    log_info "ebpf_exporter.service installed. It will start on next boot or:"
+    log_info "  systemctl start ebpf_exporter"
     return 0
 }
 
@@ -734,7 +816,6 @@ setup_node_environment() {
 
     NEBULA_VERSION="v1.9.5"
     ARCH="amd64"
-    EBPF_VER="v3.5.0"
     TMP_DIR=$(mktemp -d) || { log_err "mktemp failed"; exit 2; }
 
     install_nebula_if_missing
