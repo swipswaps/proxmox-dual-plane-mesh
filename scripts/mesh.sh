@@ -1,0 +1,711 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# mesh.sh — unified Nebula mesh management
+#
+# Commands:
+#   onboard <name> [ip] [groups]   Lighthouse: sign cert, build one-file bundle
+#   join <bundle-file>             Client: install from local bundle
+#   join-b64 <base64-string>       Client: install from inline base64
+#   join-b64-file <path>           Client: install from base64 file
+#   join-from <user@host> [name]   Client: fetch bundle over SSH, then join
+#   shred <name>                   Lighthouse: destroy a bundle
+#   verify [peer-ip]               Both: verify mesh health with evidence
+#   latency [peer-ip]              Both: RFC 6349/5357 latency audit
+#   audit                          Both: constraints + diagnostics
+#   update                         Both: safe repo update
+#   help                           Show usage
+#
+# Exit codes: 0 success, 2 recoverable failure, 3 usage error.
+#
+# Citations:
+#   RFC 6349 (TCP throughput methodology)
+#     https://www.rfc-editor.org/rfc/rfc6349.html
+#   RFC 5357 (Two-Way Active Measurement Protocol)
+#     https://www.rfc-editor.org/rfc/rfc5357.html
+#   RFC 4656 (One-Way Active Measurement Protocol)
+#     https://www.rfc-editor.org/rfc/rfc4656.html
+#   RFC 768  (UDP)
+#     https://www.rfc-editor.org/rfc/rfc768.html
+#   RFC 8085 (UDP Usage Guidelines)
+#     https://www.rfc-editor.org/rfc/rfc8085.html
+#   NIST SP 800-77 Rev 1 (IPsec VPNs)
+#     https://csrc.nist.gov/publications/detail/sp/800-77/rev-1/final
+# ==============================================================================
+set -uo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_err()   { echo -e "${RED}[ERROR]${NC} $1"; }
+log_step()  { echo -e "${CYAN}[STEP]${NC} $1"; }
+log_bold()  { echo -e "${BOLD}$1${NC}"; }
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "${SELF_DIR}")"
+OFFER_ROOT="/var/lib/mesh-onboard/offers"
+NEBULA_CONF="/etc/nebula/config.yml"
+
+# --------------------------------------------------------------------------
+# Utility functions
+# --------------------------------------------------------------------------
+
+die_usage() { log_err "$1"; exit 3; }
+die_fail()  { log_err "$1"; exit 2; }
+
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_err "This command must run as root."
+        log_err "Try: sudo $0 $*"
+        exit 3
+    fi
+    # Cache sudo credentials once so nothing else prompts.
+    sudo -v || { log_err "cannot acquire sudo"; exit 3; }
+}
+
+is_lighthouse() {
+    [[ -f /etc/nebula/ca.key ]] && [[ -f /etc/nebula/ca.crt ]]
+}
+
+detect_operator_user() {
+    echo "${SUDO_USER:-root}"
+}
+
+ask_nonempty() {
+    local prompt="$1" __varname="$2" input=""
+    while [[ -z "${input}" ]]; do
+        read -rp "${prompt}: " input
+        [[ -z "${input}" ]] && log_warn "required"
+    done
+    eval "${__varname}=\"\${input}\""
+}
+
+ask_cidr() {
+    local prompt="$1" default="$2" __varname="$3" input=""
+    while true; do
+        read -rp "${prompt} [${default}]: " input
+        [[ -z "${input}" ]] && input="${default}"
+        if [[ "${input}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]]; then
+            local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}"
+            local o3="${BASH_REMATCH[3]}" o4="${BASH_REMATCH[4]}" m="${BASH_REMATCH[5]}"
+            if (( o1<=255 && o2<=255 && o3<=255 && o4<=255 && m>=1 && m<=32 )); then
+                break
+            fi
+        fi
+        log_warn "invalid CIDR (expected a.b.c.d/NN)"
+    done
+    eval "${__varname}=\"\${input}\""
+}
+
+detect_lan_ip() {
+    local ip
+    ip="$(ip -brief addr show scope global | awk '$1!="nebula0" && $3 ~ /^[0-9]+\./ {print $3; exit}')"
+    ip="${ip%%/*}"
+    [[ -z "${ip}" ]] && ip="$(hostname -I | awk '{print $1}')"
+    echo "${ip}"
+}
+
+detect_public_ip() {
+    local ip=""
+    for url in ifconfig.me icanhazip.com api.ipify.org; do
+        if ip="$(curl -fsS --max-time 4 "https://${url}")"; then
+            [[ -n "${ip}" ]] && break
+        fi
+    done
+    echo "${ip}"
+}
+
+detect_mesh_ip() {
+    local ip
+    ip="$(ip -brief addr show nebula0 2>/dev/null | awk '{print $3; exit}')"
+    ip="${ip%%/*}"
+    echo "${ip:-10.100.0.1}"
+}
+
+# RFC 1918 + CGNAT detection
+is_cgnat() {
+    local ip="$1"
+    [[ "${ip}" =~ ^100\.(6[4-9]|[7-9][0-9]|1[0-2][0-7])\. ]] && return 0
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# SSH ControlMaster: one password prompt, then no more
+# --------------------------------------------------------------------------
+
+setup_ssh_ctl() {
+    local user="$1" host="$2" port="${3:-22}"
+    local ctl_dir="${HOME}/.ssh/cm"
+    mkdir -p "${ctl_dir}" || true
+    chmod 700 "${ctl_dir}" || true
+    MESH_SSH_CTL="${ctl_dir}/mesh-${user}-${host}-${port}"
+    export MESH_SSH_CTL
+
+    # If a master is already alive, reuse it
+    if ssh -o "ControlPath=${MESH_SSH_CTL}" -O check "${user}@${host}" 2>&1 | grep -q 'Master running'; then
+        log_info "Reusing existing SSH control master."
+        return 0
+    fi
+
+    log_step "Establishing SSH control master (single password prompt)"
+    # StrictHostKeyChecking=accept-new removes the fingerprint yes/no prompt.
+    # ControlPersist keeps the connection alive for 5 minutes so scp and any
+    # subsequent ssh calls reuse the same authenticated session.
+    if ! ssh -o "ControlMaster=yes" \
+             -o "ControlPath=${MESH_SSH_CTL}" \
+             -o "ControlPersist=300" \
+             -o "StrictHostKeyChecking=accept-new" \
+             -o "ConnectTimeout=15" \
+             -p "${port}" \
+             "${user}@${host}" true; then
+        return 2
+    fi
+    return 0
+}
+
+teardown_ssh_ctl() {
+    local user="$1" host="$2" port="${3:-22}"
+    if [[ -n "${MESH_SSH_CTL:-}" ]]; then
+        ssh -o "ControlPath=${MESH_SSH_CTL}" -O exit "${user}@${host}" >/dev/null 2>&1 || true
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Command: onboard (Lighthouse)
+# --------------------------------------------------------------------------
+
+cmd_onboard() {
+    need_root "$@"
+    is_lighthouse || die_fail "Not a Lighthouse (ca.key/ca.crt missing)."
+
+    local name="${1:-}"
+    local ip="${2:-}"
+    local groups="${3:-}"
+
+    if [[ -z "${name}" ]]; then
+        echo ""
+        log_bold "=== Prepare Onboarding Bundle ==="
+        echo ""
+        ask_nonempty "New node name" name
+    fi
+    if [[ -z "${ip}" ]]; then
+        ask_cidr "New node mesh IP" "10.100.0.2/24" ip
+    fi
+    if [[ -z "${groups}" ]]; then
+        read -rp "New node groups [agents,telemetry]: " groups
+        groups="${groups:-agents,telemetry}"
+    fi
+
+    local mesh_ip lan_ip public_ip
+    mesh_ip="$(detect_mesh_ip)"
+    lan_ip="$(detect_lan_ip)"
+    public_ip="$(detect_public_ip)"
+    local cgnat=0
+    is_cgnat "${public_ip}" && cgnat=1
+
+    log_info "Node name  : ${name}"
+    log_info "Node IP    : ${ip}"
+    log_info "Groups     : ${groups}"
+    log_info "Mesh IP    : ${mesh_ip}"
+    log_info "LAN IP     : ${lan_ip:-<unknown>}"
+    log_info "Public IP  : ${public_ip:-<unknown>}"
+    if (( cgnat == 1 )); then
+        log_warn "Public IP is in CGNAT range; internet reachability requires a VPS or Tor."
+    fi
+
+    local stage
+    stage="$(mktemp -d)" || die_fail "mktemp failed"
+    chmod 700 "${stage}"
+    trap 'rm -rf "${stage}"' EXIT
+
+    log_step "Signing certificate"
+    nebula-cert sign \
+        -name "${name}" \
+        -ip "${ip}" \
+        -groups "${groups}" \
+        -ca-crt /etc/nebula/ca.crt \
+        -ca-key /etc/nebula/ca.key \
+        -out-crt "${stage}/host.crt" \
+        -out-key "${stage}/host.key" || die_fail "sign failed"
+
+    cp /etc/nebula/ca.crt "${stage}/ca.crt" || die_fail "copy ca.crt failed"
+
+    cat > "${stage}/offer.env" << ENVEOF
+NODE_NAME=${name}
+NODE_IP=${ip}
+NODE_GROUPS=${groups}
+LIGHTHOUSE_MESH=${mesh_ip}
+LIGHTHOUSE_LAN=${lan_ip}
+LIGHTHOUSE_PUBLIC=${public_ip}
+GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+ENVEOF
+
+    mkdir -p "${OFFER_ROOT}" || die_fail "mkdir ${OFFER_ROOT} failed"
+    chown "root:$(detect_operator_user)" "${OFFER_ROOT}" 2>&1 >/dev/null || true
+    chmod 750 "${OFFER_ROOT}" || true
+
+    local bundle_tgz="${OFFER_ROOT}/${name}.tar.gz"
+    local bundle_b64="${OFFER_ROOT}/${name}.b64"
+
+    tar -czf "${bundle_tgz}" -C "${stage}" ca.crt host.crt host.key offer.env || die_fail "tar failed"
+    base64 -w 0 "${bundle_tgz}" > "${bundle_b64}" || die_fail "base64 failed"
+
+    local op_user; op_user="$(detect_operator_user)"
+    chown "${op_user}:${op_user}" "${bundle_tgz}" "${bundle_b64}" || true
+    chmod 600 "${bundle_tgz}" "${bundle_b64}"
+
+    local tgz_size b64_size
+    tgz_size="$(stat -c%s "${bundle_tgz}")"
+    b64_size="$(stat -c%s "${bundle_b64}")"
+
+    echo ""
+    log_bold "=== Bundle Ready ==="
+    echo ""
+    echo "  ${bundle_tgz}  (${tgz_size} bytes)"
+    echo "  ${bundle_b64}  (${b64_size} bytes)"
+    echo ""
+    log_bold "Client command — pick ONE:"
+    echo ""
+    echo -e "${CYAN}[A] Same-LAN, one command:${NC}"
+    echo "  sudo $(basename "$0") join-from ${op_user}@${lan_ip:-<lighthouse-lan>} ${name}"
+    echo ""
+    echo -e "${CYAN}[B] Local file (scp the bundle first):${NC}"
+    echo "  scp ${op_user}@${lan_ip:-<lighthouse>}:${bundle_tgz} ~/${name}.tar.gz"
+    echo "  sudo $(basename "$0") join ~/${name}.tar.gz"
+    echo ""
+    echo -e "${CYAN}[C] Copy-paste base64 (no network path needed):${NC}"
+    echo "  cat ${bundle_b64}"
+    echo "  # then on the client:"
+    echo "  sudo $(basename "$0") join-b64 '<paste>'"
+    echo ""
+    log_bold "Verify immediately with:"
+    echo "  sudo $(basename "$0") verify"
+    echo ""
+    log_bold "Shred the bundle after the client has joined:"
+    echo "  sudo $(basename "$0") shred ${name}"
+    echo ""
+}
+
+# --------------------------------------------------------------------------
+# Command: join (Client)
+# --------------------------------------------------------------------------
+
+join_from_bundle() {
+    local bundle_path="$1"
+    [[ -f "${bundle_path}" ]] || die_fail "bundle not found: ${bundle_path}"
+
+    local extract
+    extract="$(mktemp -d)"
+    chmod 700 "${extract}"
+    trap 'rm -rf "${extract}"' EXIT
+
+    log_step "Extracting bundle"
+    tar -xzf "${bundle_path}" -C "${extract}" \
+        --no-same-owner --no-same-permissions || die_fail "extract failed"
+
+    local f
+    for f in ca.crt host.crt host.key offer.env; do
+        [[ -f "${extract}/${f}" ]] || die_fail "bundle missing ${f}"
+    done
+
+    # shellcheck source=/dev/null
+    source "${extract}/offer.env" || die_fail "cannot parse offer.env"
+
+    log_info "Node name  : ${NODE_NAME}"
+    log_info "Node IP    : ${NODE_IP}"
+    log_info "Lighthouse : ${LIGHTHOUSE_MESH}"
+
+    # Choose address: prefer LAN if reachable, else public.
+    local use=""
+    if [[ -n "${LIGHTHOUSE_LAN:-}" ]] && ip route get "${LIGHTHOUSE_LAN}" >/dev/null 2>&1; then
+        use="${LIGHTHOUSE_LAN}"
+    elif [[ -n "${LIGHTHOUSE_PUBLIC:-}" ]]; then
+        use="${LIGHTHOUSE_PUBLIC}"
+    else
+        use="${LIGHTHOUSE_LAN:-10.100.0.1}"
+    fi
+    log_info "Using Lighthouse address: ${use}"
+
+    systemctl stop nebula >/dev/null 2>&1 || true
+
+    log_step "Installing certificates"
+    mkdir -p /etc/nebula
+    chmod 700 /etc/nebula
+    install -o root -g root -m 644 "${extract}/ca.crt"   /etc/nebula/ca.crt   || die_fail "install ca.crt failed"
+    install -o root -g root -m 644 "${extract}/host.crt" /etc/nebula/host.crt || die_fail "install host.crt failed"
+    install -o root -g root -m 600 "${extract}/host.key" /etc/nebula/host.key || die_fail "install host.key failed"
+
+    log_step "Writing /etc/nebula/config.yml"
+    cat > /etc/nebula/config.yml << CFGEOF
+pki:
+  ca: /etc/nebula/ca.crt
+  cert: /etc/nebula/host.crt
+  key: /etc/nebula/host.key
+
+static_host_map:
+  "${LIGHTHOUSE_MESH}": ["${use}:4242"]
+
+lighthouse:
+  am_lighthouse: false
+  interval: 10
+  hosts:
+    - "${LIGHTHOUSE_MESH}"
+
+listen:
+  host: 0.0.0.0
+  port: 0
+
+punchy:
+  punch: true
+
+tun:
+  dev: nebula0
+  drop_local_broadcast: true
+  drop_multicast: true
+  tx_queue: 500
+  mtu: 1300
+
+logging:
+  level: info
+  format: text
+
+firewall:
+  conntrack:
+    tcp_timeout: 12m
+    udp_timeout: 3m
+    default_timeout: 10m
+  outbound:
+    - port: any
+      proto: any
+      host: any
+  inbound:
+    - port: any
+      proto: any
+      group: telemetry
+CFGEOF
+
+    [[ -f /etc/systemd/system/nebula.service ]] || die_fail "run install.sh once on this machine before join"
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    log_step "Starting nebula"
+    systemctl start nebula >/dev/null 2>&1 || log_warn "start returned non-zero"
+
+    local expected="${NODE_IP%%/*}"
+    local waited=0 limit=15 ok=0
+    while (( waited < limit )); do
+        if systemctl is-active --quiet nebula; then
+            if ip link show nebula0 >/dev/null 2>&1; then
+                local actual bare
+                actual="$(ip -brief addr show nebula0 | awk '{print $3; exit}')"
+                bare="${actual%%/*}"
+                if [[ "${bare}" == "${expected}" ]]; then
+                    ok=1
+                    log_info "nebula.service active, nebula0 up with ${actual}"
+                    break
+                fi
+            fi
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if (( ok != 1 )); then
+        log_err "runtime gate failed"
+        systemctl status nebula --no-pager -l || true
+        journalctl -u nebula -n 30 --no-pager -l || true
+        exit 2
+    fi
+
+    local peer="${LIGHTHOUSE_MESH%%/*}"
+    if ping -c 3 -W 2 "${peer}" >/dev/null 2>&1; then
+        log_info "Ping to Lighthouse ${peer}: OK"
+    else
+        log_warn "Ping to Lighthouse ${peer} failed"
+    fi
+
+    echo ""
+    log_bold "=== Joined ==="
+    echo ""
+    echo "  Node name   : ${NODE_NAME}"
+    echo "  Mesh IP     : ${NODE_IP}"
+    echo "  Lighthouse  : ${LIGHTHOUSE_MESH} via ${use}"
+    echo ""
+    log_bold "Next:"
+    echo "  sudo $(basename "$0") verify ${LIGHTHOUSE_MESH%%/*}"
+    echo "  sudo $(basename "$0") latency ${LIGHTHOUSE_MESH%%/*}"
+    echo ""
+}
+
+cmd_join() {
+    need_root "$@"
+    [[ $# -ge 1 ]] || die_usage "usage: $0 join <bundle-file>"
+    join_from_bundle "$1"
+}
+
+cmd_join_b64() {
+    need_root "$@"
+    [[ $# -ge 1 ]] || die_usage "usage: $0 join-b64 '<base64-string>'"
+    local tmp
+    tmp="$(mktemp --suffix=.tar.gz)"
+    printf '%s' "$1" | base64 -d > "${tmp}" || die_fail "base64 decode failed"
+    join_from_bundle "${tmp}"
+    rm -f "${tmp}"
+}
+
+cmd_join_b64_file() {
+    need_root "$@"
+    [[ $# -ge 1 ]] || die_usage "usage: $0 join-b64-file <path>"
+    [[ -f "$1" ]] || die_fail "not a file: $1"
+    local tmp
+    tmp="$(mktemp --suffix=.tar.gz)"
+    tr -d '\n\r \t' < "$1" | base64 -d > "${tmp}" || die_fail "base64 decode failed"
+    join_from_bundle "${tmp}"
+    rm -f "${tmp}"
+}
+
+cmd_join_from() {
+    need_root "$@"
+    [[ $# -ge 1 ]] || die_usage "usage: $0 join-from <user@host> [node-name]"
+
+    local spec="$1"
+    local name="${2:-$(hostname -s 2>/dev/null || echo client)}"
+    local ssh_user host port
+    ssh_user="${spec%%@*}"
+    host="${spec#*@}"
+    port=22
+
+    if [[ "${host}" == *:* ]]; then
+        port="${host##*:}"
+        host="${host%%:*}"
+    fi
+    [[ -z "${ssh_user}" ]] && ssh_user="$(detect_operator_user)"
+
+    setup_ssh_ctl "${ssh_user}" "${host}" "${port}" || die_fail "SSH setup failed"
+
+    local remote_bundle="${OFFER_ROOT}/${name}.tar.gz"
+    local local_bundle
+    local_bundle="$(mktemp --suffix=.tar.gz)"
+
+    log_step "Retrieving ${ssh_user}@${host}:${remote_bundle}"
+    scp -o "ControlPath=${MESH_SSH_CTL}" \
+        "${ssh_user}@${host}:${remote_bundle}" "${local_bundle}" \
+        || { teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"; die_fail "scp failed"; }
+
+    teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
+
+    join_from_bundle "${local_bundle}"
+    rm -f "${local_bundle}"
+}
+
+# --------------------------------------------------------------------------
+# Command: shred (Lighthouse)
+# --------------------------------------------------------------------------
+
+cmd_shred() {
+    need_root "$@"
+    [[ $# -ge 1 ]] || die_usage "usage: $0 shred <name>"
+
+    local name="$1"
+    local tgz="${OFFER_ROOT}/${name}.tar.gz"
+    local b64="${OFFER_ROOT}/${name}.b64"
+    local found=0
+
+    if [[ -f "${tgz}" ]]; then
+        shred -u "${tgz}" 2>/dev/null || rm -f "${tgz}"
+        log_info "shredded ${tgz}"
+        found=1
+    fi
+    if [[ -f "${b64}" ]]; then
+        shred -u "${b64}" 2>/dev/null || rm -f "${b64}"
+        log_info "shredded ${b64}"
+        found=1
+    fi
+
+    if (( found == 0 )); then
+        log_warn "no bundle found for ${name}"
+        exit 2
+    fi
+    exit 0
+}
+
+# --------------------------------------------------------------------------
+# Command: verify
+# --------------------------------------------------------------------------
+
+cmd_verify() {
+    need_root "$@"
+    local peer="${1:-}"
+    local errors=0
+
+    log_step "Mesh interface"
+    if ip link show nebula0 >/dev/null 2>&1; then
+        ip -brief addr show nebula0
+    else
+        log_err "nebula0 not present"
+        errors=$((errors + 1))
+    fi
+
+    log_step "nebula.service"
+    if systemctl is-active --quiet nebula; then
+        local rc nrestarts
+        rc="$(systemctl show -p NRestarts --value nebula)"
+        nrestarts="${rc:-0}"
+        echo "  active (restarts since boot: ${nrestarts})"
+        if (( nrestarts > 2 )); then
+            log_err "nebula is flapping"
+            errors=$((errors + 1))
+        fi
+    else
+        log_err "nebula.service not active"
+        errors=$((errors + 1))
+    fi
+
+    log_step "UDP 4242"
+    if ss -lun | grep -q ':4242\b'; then
+        echo "  bound"
+    else
+        log_warn "UDP 4242 not bound (expected on Lighthouse)"
+    fi
+
+    log_step "PKI"
+    if [[ -f /etc/nebula/host.crt ]]; then
+        /usr/local/bin/nebula-cert print -path /etc/nebula/host.crt 2>&1 | grep -E 'Name:|Ips:|Groups:' || true
+    else
+        log_err "no host certificate"
+        errors=$((errors + 1))
+    fi
+
+    if [[ -n "${peer}" ]]; then
+        log_step "Peer reachability: ${peer}"
+        if ping -c 3 -W 2 "${peer}" >/dev/null 2>&1; then
+            local rtt
+            rtt="$(ping -c 3 -W 2 "${peer}" | tail -1)"
+            echo "  ${rtt}"
+        else
+            log_err "cannot reach ${peer}"
+            errors=$((errors + 1))
+        fi
+    fi
+
+    echo ""
+    if (( errors == 0 )); then
+        log_info "All checks passed."
+        exit 0
+    else
+        log_err "${errors} check(s) failed."
+        exit 2
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Command: latency
+# --------------------------------------------------------------------------
+
+cmd_latency() {
+    need_root "$@"
+    local peer="${1:-$(detect_mesh_ip)}"
+    [[ -x "${SELF_DIR}/latency-audit.sh" ]] || die_fail "latency-audit.sh not found or not executable"
+    exec "${SELF_DIR}/latency-audit.sh" "${peer}"
+}
+
+# --------------------------------------------------------------------------
+# Command: audit
+# --------------------------------------------------------------------------
+
+cmd_audit() {
+    need_root "$@"
+
+    log_step "Constraint compliance"
+    if [[ -x "${REPO_ROOT}/scripts/check_constraints.sh" ]]; then
+        "${REPO_ROOT}/scripts/check_constraints.sh" || true
+    else
+        log_warn "check_constraints.sh not present"
+    fi
+
+    log_step "Full diagnostics"
+    if [[ -x "${REPO_ROOT}/install.sh" ]]; then
+        "${REPO_ROOT}/install.sh" --doctor
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Command: update
+# --------------------------------------------------------------------------
+
+cmd_update() {
+    log_step "Checking repository state"
+    if [[ ! -d "${REPO_ROOT}/.git" ]]; then
+        die_fail "not a git checkout: ${REPO_ROOT}"
+    fi
+
+    cd "${REPO_ROOT}"
+    local branch
+    branch="$(git rev-parse --abbrev-ref HEAD)"
+
+    if ! git diff --quiet --exit-code || ! git diff --cached --quiet --exit-code; then
+        log_warn "Uncommitted changes present."
+        read -rp "Stash local changes and continue? [y/N]: " yn
+        if [[ "${yn}" != "y" ]]; then
+            log_warn "Aborted. Commit or discard your changes first."
+            exit 2
+        fi
+        git stash push -u -m "mesh.sh update $(date -u +%Y-%m-%dT%H:%M:%SZ)" || die_fail "stash failed"
+    fi
+
+    git fetch origin || die_fail "git fetch failed"
+    git pull --ff-only origin "${branch}" || die_fail "git pull failed"
+
+    log_info "Repository updated to $(git rev-parse --short HEAD)"
+    exit 0
+}
+
+# --------------------------------------------------------------------------
+# Dispatch
+# --------------------------------------------------------------------------
+
+usage() {
+    cat << USAGEEOF
+mesh.sh — unified Nebula mesh management
+
+Commands:
+  onboard <name> [ip] [groups]      Lighthouse: sign cert, build one-file bundle
+  join <bundle-file>                Client: install from local bundle
+  join-b64 <base64-string>          Client: install from inline base64
+  join-b64-file <path>              Client: install from base64 file
+  join-from <user@host> [name]      Client: fetch bundle over SSH, then join
+  shred <name>                      Lighthouse: destroy a bundle
+  verify [peer-ip]                  Both: verify mesh health with evidence
+  latency [peer-ip]                 Both: RFC 6349/5357 latency audit
+  audit                             Both: constraints + diagnostics
+  update                            Both: safe repo update
+  help                              This message
+
+Examples:
+  sudo ./scripts/mesh.sh onboard fedora
+  sudo ./scripts/mesh.sh join-from owner@192.168.1.160 fedora
+  sudo ./scripts/mesh.sh verify 10.100.0.1
+  sudo ./scripts/mesh.sh latency 10.100.0.1
+USAGEEOF
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 3
+fi
+
+case "$1" in
+    onboard)       shift; cmd_onboard "$@" ;;
+    join)          shift; cmd_join "$@" ;;
+    join-b64)      shift; cmd_join_b64 "$@" ;;
+    join-b64-file) shift; cmd_join_b64_file "$@" ;;
+    join-from)     shift; cmd_join_from "$@" ;;
+    shred)         shift; cmd_shred "$@" ;;
+    verify)        shift; cmd_verify "$@" ;;
+    latency)       shift; cmd_latency "$@" ;;
+    audit)         shift; cmd_audit "$@" ;;
+    update)        shift; cmd_update "$@" ;;
+    help|--help|-h) usage; exit 0 ;;
+    *) die_usage "unknown command: $1 (see: $0 help)" ;;
+esac
