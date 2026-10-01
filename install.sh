@@ -458,8 +458,8 @@ run_full_diagnostics() {
 
     if [[ -n "${TYPESAFE_API_KEY:-}" ]]; then
         log_info "TYPESAFE_API_KEY detected."
-        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TYPESAFE_API_KEY}" https://api.typesafe.ai/v1/health || echo "000")
-        log_info "TypeSafe API check HTTP status: ${HTTP_STATUS}"
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${TYPESAFE_API_KEY}" "https://api.typesafe.ai/v1/models" || echo "000")
+        log_info "TypeSafe API /v1/models HTTP status: ${HTTP_STATUS}"
     else
         log_warn "TYPESAFE_API_KEY missing!"
         read -rp "Enter your TypeSafe API Key (or Enter to skip): " ENTERED_KEY
