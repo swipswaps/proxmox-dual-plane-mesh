@@ -28,11 +28,11 @@ set -uo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_err()   { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step()  { echo -e "${CYAN}[STEP]${NC} $1"; }
-log_bold()  { echo -e "${BOLD}$1${NC}"; }
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1" >&2; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+log_err()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+log_step()  { echo -e "${CYAN}[STEP]${NC} $1" >&2; }
+log_bold()  { echo -e "${BOLD}$1${NC}" >&2; }
 
 PROM_CONF="/etc/prometheus/prometheus.yml"
 GRAF_INI="/etc/grafana/grafana.ini"
@@ -109,9 +109,29 @@ detect_grafana_group() {
 }
 
 pick_free_port() {
-    # Fedora's SELinux policy restricts the grafana_t domain to a fixed
-    # set of ports. Binding to any other port fails with EACCES. Prefer
-    # an already-permitted port; if none is free, extend the policy.
+    # Reuse the currently-configured port when it is either free or held
+    # by Grafana itself. Only pick a new port when the current one is
+    # genuinely occupied by an unrelated service.
+    local configured=""
+    if [[ -f "${GRAF_INI}" ]]; then
+        configured="$(awk -F= '/^[ \t]*http_port[ \t]*=/ {gsub(/[ \t]/,"",$2); print $2; exit}' "${GRAF_INI}")"
+    fi
+
+    if [[ -n "${configured}" ]] && [[ "${configured}" =~ ^[0-9]+$ ]]; then
+        local line
+        line="$(ss -H -lntup | grep -E "[:.]${configured}[[:space:]]")"
+        if [[ -z "${line}" ]]; then
+            echo "${configured}"
+            return 0
+        fi
+        if [[ "${line}" == *grafana* ]]; then
+            echo "${configured}"
+            return 0
+        fi
+    fi
+
+    # Fall through: prefer SELinux-permitted ports, then extend the policy
+    # if none of them are free.
     local allowed=""
     local p
     local free=""
@@ -281,9 +301,9 @@ install_dashboards() {
             continue
         fi
 
-        python3 - "${raw}" "${final}" << 'PYEOF' || log_warn "patch failed"
+        python3 - "${raw}" "${final}" "${id}" << 'PYEOF' || log_warn "patch failed"
 import json, sys, re
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, dash_id = sys.argv[1], sys.argv[2], sys.argv[3]
 uid = "prometheus_mesh"
 with open(src) as f:
     data = json.load(f)
@@ -297,7 +317,10 @@ text = re.sub(r'"?\$\{DS_[A-Z0-9_]+\}"?', '"' + uid + '"', text)
 patched = json.loads(text)
 patched.pop("__inputs", None)
 patched.pop("__requires", None)
-patched["uid"] = "mesh-" + str(patched.get("id", "0"))
+# Use the grafana.com numeric id for the uid. The downloaded JSON has
+# "id": null, so using patched["id"] gives every dashboard the same
+# "mesh-None" uid and they collide in Grafana.
+patched["uid"] = "mesh-" + dash_id
 with open(dst, "w") as f:
     json.dump(patched, f, indent=2)
 print("patched " + dst)
