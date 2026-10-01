@@ -34,14 +34,6 @@ fi
 # ==============================================================================
 # OS DETECTION
 # ==============================================================================
-# Sets:
-#   OS_FAMILY   = "debian" | "fedora" | "unknown"
-#   PKG_MGR     = "apt-get" | "dnf"
-#   PKG_INSTALL = "apt-get install -y" | "dnf install -y"
-#   PKG_UPDATE  = "apt-get update -y"  | "dnf makecache"
-#   TOR_USER    = "debian-tor"         | "tor"
-# ==============================================================================
-
 OS_FAMILY="unknown"
 PKG_MGR=""
 PKG_INSTALL=""
@@ -58,7 +50,7 @@ detect_os() {
         fi
         PKG_INSTALL="${PKG_MGR} install -y"
         PKG_UPDATE="${PKG_MGR} makecache"
-        TOR_USER="tor"
+        TOR_USER="toranon"
     elif [[ -f /etc/debian_version ]]; then
         OS_FAMILY="debian"
         PKG_MGR="apt-get"
@@ -87,19 +79,112 @@ pkg_name_for() {
     if [[ "${OS_FAMILY}" == "fedora" ]]; then
         case "${logical}" in
             prometheus-node-exporter) echo "node_exporter" ;;
-            prometheus-blackbox-exporter) echo "golang-github-prometheus-blackbox-exporter" ;;
+            prometheus-blackbox-exporter) echo "" ;;
             bpfcc-tools) echo "bcc-tools" ;;
             build-essential) echo "gcc gcc-c++ make" ;;
             python3-venv) echo "python3-virtualenv" ;;
             netcat-openbsd) echo "nmap-ncat" ;;
             host) echo "bind-utils" ;;
-            lsb-release) echo "redhat-lsb-core" ;;
+            lsb-release) echo "" ;;
+            iproute2) echo "iproute" ;;
             gnupg) echo "gnupg2" ;;
             *) echo "${logical}" ;;
         esac
     else
         echo "${logical}"
     fi
+}
+
+# ==============================================================================
+# INTERACTIVE INPUT HELPERS
+# ==============================================================================
+
+ask_default() {
+    local prompt="$1"
+    local default="$2"
+    local __varname="$3"
+    local input=""
+    if [[ -n "${default}" ]]; then
+        read -rp "${prompt} [${default}]: " input
+        if [[ -z "${input}" ]]; then
+            input="${default}"
+        fi
+    else
+        while [[ -z "${input}" ]]; do
+            read -rp "${prompt}: " input
+            if [[ -z "${input}" ]]; then
+                log_warn "This field is required."
+            fi
+        done
+    fi
+    eval "${__varname}=\"\${input}\""
+}
+
+is_valid_cidr() {
+    local value="$1"
+    local ip mask
+    ip="${value%%/*}"
+    mask="${value##*/}"
+    if [[ "${value}" != */* ]] || [[ -z "${mask}" ]]; then
+        return 1
+    fi
+    if ! [[ "${mask}" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if (( mask < 1 || mask > 32 )); then
+        return 1
+    fi
+    if ! [[ "${ip}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        return 1
+    fi
+    local o
+    for o in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+        if (( o < 0 || o > 255 )); then
+            return 1
+        fi
+    done
+    return 0
+}
+
+ask_cidr() {
+    local prompt="$1"
+    local default="$2"
+    local __varname="$3"
+    local input=""
+    while true; do
+        if [[ -n "${default}" ]]; then
+            read -rp "${prompt} [${default}]: " input
+        else
+            read -rp "${prompt}: " input
+        fi
+        if [[ -z "${input}" ]]; then
+            input="${default}"
+        fi
+        if [[ -z "${input}" ]]; then
+            log_warn "This field is required."
+            continue
+        fi
+        if is_valid_cidr "${input}"; then
+            break
+        fi
+        log_warn "Not a valid IPv4 CIDR (expected form a.b.c.d/NN, e.g. 10.100.0.1/24)."
+    done
+    eval "${__varname}=\"\${input}\""
+}
+
+ask_menu() {
+    local prompt="$1"
+    local valid="$2"
+    local __varname="$3"
+    local input=""
+    while true; do
+        read -rp "${prompt}" input
+        if [[ "${input}" =~ ${valid} ]]; then
+            break
+        fi
+        log_warn "Invalid choice. Expected one of: ${valid}"
+    done
+    eval "${__varname}=\"\${input}\""
 }
 
 # ==============================================================================
@@ -172,6 +257,102 @@ is_pve_host() {
 }
 
 # ==============================================================================
+# SERVICE DIRECTORY PREPARATION
+# ==============================================================================
+
+ensure_service_dirs() {
+    log_step "Ensuring service runtime and log directories exist..."
+
+    mkdir -p /var/log/nebula || log_warn "could not create /var/log/nebula"
+    chmod 755 /var/log/nebula || log_warn "chmod /var/log/nebula failed"
+
+    mkdir -p /var/log/prometheus || log_warn "could not create /var/log/prometheus"
+    chmod 755 /var/log/prometheus || log_warn "chmod /var/log/prometheus failed"
+
+    mkdir -p /var/lib/prometheus || log_warn "could not create /var/lib/prometheus"
+    chmod 755 /var/lib/prometheus || log_warn "chmod /var/lib/prometheus failed"
+    if id prometheus >/dev/null; then
+        chown -R prometheus:prometheus /var/lib/prometheus || log_warn "chown /var/lib/prometheus failed"
+        chown -R prometheus:prometheus /var/log/prometheus || log_warn "chown /var/log/prometheus failed"
+    fi
+
+    return 0
+}
+
+# ==============================================================================
+# NEBULA RUNTIME VERIFICATION
+# ==============================================================================
+# Waits for nebula.service to be active, the tun device to appear with the
+# expected IP, the restart count to be low, and UDP 4242 to be bound.
+# Fails loudly with diagnostics if any check does not pass within the window.
+# ==============================================================================
+
+verify_nebula_runtime() {
+    local expected_dev="$1"
+    local expected_ip="$2"
+    local listen_port="${3:-4242}"
+    local waited=0
+    local limit=15
+
+    log_step "Verifying nebula runtime (dev=${expected_dev}, ip=${expected_ip}, port=${listen_port}/udp)..."
+
+    while (( waited < limit )); do
+        if systemctl is-active --quiet nebula; then
+            if ip link show "${expected_dev}" >/dev/null 2>&1; then
+                local actual_ip
+                actual_ip="$(ip -brief addr show "${expected_dev}" | awk '{print $3}' | head -n1)"
+                if [[ "${actual_ip}" == "${expected_ip}" ]]; then
+                    log_info "nebula.service active, ${expected_dev} up with ${actual_ip}"
+                    break
+                else
+                    log_warn "${expected_dev} present but address is '${actual_ip}', expected '${expected_ip}'"
+                fi
+            fi
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if (( waited >= limit )); then
+        log_err "nebula.service failed to reach a healthy state within ${limit}s."
+        log_err "Diagnostic snapshot:"
+        echo "--- systemctl status ---"
+        systemctl status nebula --no-pager -l || true
+        echo "--- journalctl ---"
+        journalctl -u nebula -n 30 --no-pager -l || true
+        echo "--- ip link ---"
+        ip -brief link || true
+        echo "--- /etc/nebula ---"
+        ls -la /etc/nebula || true
+        return 2
+    fi
+
+    # Additional assertions that go beyond interface presence.
+
+    local restarts
+    restarts="$(systemctl show -p NRestarts --value nebula)"
+    if [[ "${restarts}" =~ ^[0-9]+$ ]] && (( restarts > 2 )); then
+        log_err "nebula.service reports ${restarts} restarts since boot; not stable."
+        echo "--- journalctl (last 30) ---"
+        journalctl -u nebula -n 30 --no-pager -l || true
+        return 2
+    fi
+    log_info "Restart count check: ${restarts:-0} restarts (threshold 2)"
+
+    if ! ss -lun | grep -q ":${listen_port}\b"; then
+        log_err "nebula is running but not listening on UDP ${listen_port}."
+        echo "--- ss -lun ---"
+        ss -lun || true
+        echo "--- nebula config listen block ---"
+        grep -A4 '^listen:' /etc/nebula/config.yml || true
+        return 2
+    fi
+    log_info "UDP ${listen_port} bind check: OK"
+
+    return 0
+}
+
+# ==============================================================================
 # DIAGNOSTICS
 # ==============================================================================
 
@@ -214,12 +395,24 @@ run_full_diagnostics() {
         log_info "Tor permissions set to 0700 ${TOR_USER}: OK"
     fi
 
-    log_step "4/8 Validating Nebula PKI..."
+    log_step "4/8 Validating Nebula PKI and runtime..."
     if [[ -f /etc/nebula/host.crt ]]; then
         log_info "Host certificate detected:"
         /usr/local/bin/nebula-cert print -path /etc/nebula/host.crt || log_warn "Certificate unreadable."
     else
         log_warn "No host certificate found at /etc/nebula/host.crt."
+    fi
+    if systemctl is-active --quiet nebula; then
+        local running_dev
+        running_dev="$(grep -A1 '^tun:' /etc/nebula/config.yml | awk '/dev:/ {print $2}' | head -n1)"
+        running_dev="${running_dev:-nebula0}"
+        if ip link show "${running_dev}" >/dev/null 2>&1; then
+            log_info "nebula.service active; ${running_dev} is up"
+        else
+            log_warn "nebula.service active but ${running_dev} not present"
+        fi
+    else
+        log_warn "nebula.service is not active."
     fi
 
     log_step "5/8 Verifying Semgrep Static Analyzer..."
@@ -363,6 +556,28 @@ PYEOF
 # SERVICE DEPLOYMENT (idempotent, uses global REPO_ROOT)
 # ==============================================================================
 
+normalize_unit_sandboxing() {
+    local unit
+    for unit in /etc/systemd/system/nebula.service \
+                /etc/systemd/system/socat-tor.service \
+                /etc/systemd/system/ebpf_exporter.service \
+                /etc/systemd/system/prometheus.service; do
+        if [[ -f "${unit}" ]]; then
+            python3 - "${unit}" << 'PYEOF' || log_warn "unit normalization failed for ${unit}"
+import sys
+path = sys.argv[1]
+with open(path, "r") as f:
+    text = f.read()
+text = text.replace("ProtectSystem=strict", "ProtectSystem=full")
+text = text.replace("ProtectHome=true", "ProtectHome=read-only")
+with open(path, "w") as f:
+    f.write(text)
+PYEOF
+        fi
+    done
+    return 0
+}
+
 deploy_services() {
     log_step "Deploying systemd units and monitoring configs..."
     log_info "Using REPO_ROOT=${REPO_ROOT}"
@@ -372,6 +587,8 @@ deploy_services() {
     else
         log_err "systemd/ directory missing in ${REPO_ROOT}"; return 2
     fi
+
+    normalize_unit_sandboxing
 
     if [[ -f "${REPO_ROOT}/config/prometheus.yml" ]]; then
         cp "${REPO_ROOT}/config/prometheus.yml" /etc/prometheus/prometheus.yml || { log_err "prometheus.yml copy failed"; return 2; }
@@ -408,6 +625,11 @@ configure_firewall_if_present() {
         log_info "firewalld not present; skipping firewall configuration."
         return 0
     fi
+    if ! systemctl is-active --quiet firewalld; then
+        log_info "firewalld is installed but not running; skipping firewall configuration."
+        log_info "If you enable firewalld later, re-run: ./install.sh --doctor"
+        return 0
+    fi
     log_step "Configuring firewalld rules for mesh ports..."
     firewall-cmd --permanent --add-port=4242/udp || log_warn "failed to open UDP 4242"
     firewall-cmd --permanent --add-port=5201/tcp || log_warn "failed to open TCP 5201"
@@ -433,19 +655,24 @@ install_packages_for_os() {
     local resolved=""
     local p
     for p in "${logical_pkgs[@]}"; do
-        resolved="${resolved} $(pkg_name_for "${p}")"
+        local name
+        name="$(pkg_name_for "${p}")"
+        if [[ -n "${name}" ]]; then
+            resolved="${resolved} ${name}"
+        fi
     done
 
     log_info "Resolved package list for ${OS_FAMILY}:${resolved}"
 
     if [[ "${OS_FAMILY}" == "fedora" ]]; then
         ${PKG_UPDATE} || log_warn "${PKG_MGR} makecache reported errors; continuing"
+        # shellcheck disable=SC2086
+        ${PKG_INSTALL} --skip-unavailable ${resolved} || { log_err "package installation failed"; exit 2; }
     else
         ${PKG_UPDATE} || { log_err "${PKG_UPDATE} failed"; exit 2; }
+        # shellcheck disable=SC2086
+        ${PKG_INSTALL} ${resolved} || { log_err "package installation failed"; exit 2; }
     fi
-
-    # shellcheck disable=SC2086
-    ${PKG_INSTALL} ${resolved} || { log_err "package installation failed"; exit 2; }
     return 0
 }
 
@@ -478,9 +705,12 @@ install_ebpf_exporter_if_missing() {
         return 0
     fi
     log_info "Fetching ebpf_exporter binary ${EBPF_VER}..."
-    if wget -q -O "${TMP_DIR}/ebpf_exporter.tar.gz" "https://github.com/cloudflare/ebpf_exporter/releases/download/${EBPF_VER}/ebpf_exporter-${EBPF_VER}-linux-amd64.tar.gz"; then
+    local url="https://github.com/cloudflare/ebpf_exporter/releases/download/${EBPF_VER}/ebpf_exporter-${EBPF_VER}.linux-amd64.tar.gz"
+    if wget -q -O "${TMP_DIR}/ebpf_exporter.tar.gz" "${url}"; then
         tar -xzf "${TMP_DIR}/ebpf_exporter.tar.gz" -C /usr/local/bin/ || log_warn "ebpf_exporter extract failed"
-        [[ -f /usr/local/bin/ebpf_exporter-linux-amd64 ]] && mv /usr/local/bin/ebpf_exporter-linux-amd64 /usr/local/bin/ebpf_exporter
+        if [[ -f /usr/local/bin/ebpf_exporter-${EBPF_VER}.linux-amd64 ]]; then
+            mv "/usr/local/bin/ebpf_exporter-${EBPF_VER}.linux-amd64" /usr/local/bin/ebpf_exporter
+        fi
         chmod +x /usr/local/bin/ebpf_exporter || log_warn "chmod ebpf_exporter failed"
     else
         log_warn "ebpf_exporter download failed; eBPF metrics will be unavailable."
@@ -519,25 +749,37 @@ setup_node_environment() {
     echo "1) Setup as LIGHTHOUSE (Central Anchor)"
     echo "2) Setup as CLIENT NODE (Worker / Agent)"
     echo "3) Run Full-Stack Diagnostics & Auto-Repair ONLY"
-    read -rp "Select Option [1-3]: " ACTION_CHOICE
+    ask_menu "Select Option [1-3]: " '^[1-3]$' ACTION_CHOICE
 
-    if [[ "$ACTION_CHOICE" == "3" ]]; then
+    if [[ "${ACTION_CHOICE}" == "3" ]]; then
         run_full_diagnostics
         exit 0
     fi
 
-    read -rp "Enter Node Name [e.g., node-01]: " NODE_NAME
-    read -rp "Enter Assigned Mesh IP [e.g., 10.0.0.2/10]: " NODE_IP
-    read -rp "Enter Node Groups [default: agents,telemetry]: " NODE_GROUPS
-    NODE_GROUPS=${NODE_GROUPS:-"agents,telemetry"}
+    local HOSTNAME_SHORT
+    HOSTNAME_SHORT="$(hostname -s 2>/dev/null || echo node)"
+
+    if [[ "${ACTION_CHOICE}" == "1" ]]; then
+        ask_default "Enter Node Name" "lighthouse-01" NODE_NAME
+        ask_cidr    "Enter Assigned Mesh IP" "10.100.0.1/24" NODE_IP
+        ask_default "Enter Node Groups" "agents,telemetry" NODE_GROUPS
+    else
+        ask_default "Enter Node Name" "${HOSTNAME_SHORT}" NODE_NAME
+        ask_cidr    "Enter Assigned Mesh IP" "10.100.0.2/24" NODE_IP
+        ask_default "Enter Node Groups" "agents,telemetry" NODE_GROUPS
+    fi
+
+    log_info "Node Name    : ${NODE_NAME}"
+    log_info "Mesh IP      : ${NODE_IP}"
+    log_info "Node Groups  : ${NODE_GROUPS}"
 
     if [[ ! -f /etc/nebula/ca.crt ]]; then
         echo -e "\n${YELLOW}[PKI Setup] No CA certificate found.${NC}"
         echo "1) Generate a NEW Certificate Authority (CA) on this node"
         echo "2) Paste existing ca.crt, host.crt, and host.key manually"
-        read -rp "Select PKI Option [1 or 2]: " PKI_CHOICE
+        ask_menu "Select PKI Option [1 or 2]: " '^[12]$' PKI_CHOICE
 
-        if [[ "$PKI_CHOICE" == "1" ]]; then
+        if [[ "${PKI_CHOICE}" == "1" ]]; then
             log_info "Generating new Mesh Certificate Authority..."
             nebula-cert ca -name "Nebula-Mesh-CA" -out-crt /etc/nebula/ca.crt -out-key /etc/nebula/ca.key || { log_err "CA generation failed"; exit 2; }
             chmod 600 /etc/nebula/ca.key || log_warn "chmod ca.key failed"
@@ -547,10 +789,15 @@ setup_node_environment() {
                 -ca-crt /etc/nebula/ca.crt -ca-key /etc/nebula/ca.key \
                 -out-crt /etc/nebula/host.crt -out-key /etc/nebula/host.key || { log_err "host cert signing failed"; exit 2; }
             chmod 600 /etc/nebula/host.key || log_warn "chmod host.key failed"
+        else
+            log_info "PKI option 2 selected. Place the following files in /etc/nebula/ before starting nebula:"
+            log_info "  - ca.crt  (from your CA or from an existing Lighthouse)"
+            log_info "  - host.crt (signed for this node, or copy of a cert you have prepared)"
+            log_info "  - host.key (private key matching host.crt)"
         fi
     fi
 
-    if [[ "$ACTION_CHOICE" == "1" ]]; then
+    if [[ "${ACTION_CHOICE}" == "1" ]]; then
         log_info "Writing Lighthouse configuration..."
         cat > /etc/nebula/config.yml << 'NEBULAEOF' || { log_err "lighthouse config write failed"; exit 2; }
 pki:
@@ -571,6 +818,17 @@ listen:
 punchy:
   punch: true
 
+tun:
+  dev: nebula0
+  drop_local_broadcast: true
+  drop_multicast: true
+  tx_queue: 500
+  mtu: 1300
+
+logging:
+  level: info
+  format: text
+
 firewall:
   conntrack:
     tcp_timeout: 12m
@@ -586,8 +844,8 @@ firewall:
       host: any
 NEBULAEOF
     else
-        read -rp "Enter Lighthouse Mesh IP [e.g., 10.0.0.1]: " LIGHTHOUSE_IP
-        read -rp "Enter Lighthouse Public IP:Port [e.g., 203.0.113.50:4242]: " LIGHTHOUSE_PUBLIC
+        ask_cidr    "Enter Lighthouse Mesh IP" "10.100.0.1/24" LIGHTHOUSE_IP
+        ask_default "Enter Lighthouse Public IP:Port" "192.168.1.160:4242" LIGHTHOUSE_PUBLIC
 
         log_info "Writing Client configuration..."
         cat > /etc/nebula/config.yml << NEBULAEOF || { log_err "client config write failed"; exit 2; }
@@ -612,6 +870,17 @@ listen:
 punchy:
   punch: true
 
+tun:
+  dev: nebula0
+  drop_local_broadcast: true
+  drop_multicast: true
+  tx_queue: 500
+  mtu: 1300
+
+logging:
+  level: info
+  format: text
+
 firewall:
   conntrack:
     tcp_timeout: 12m
@@ -630,8 +899,9 @@ NEBULAEOF
 
     cat > /etc/systemd/system/nebula.service << 'SVCEOF' || { log_err "nebula.service write failed"; exit 2; }
 [Unit]
-Description=Nebula Overlay Mesh Service
-After=network.target
+Description=Nebula Mesh Overlay Network Node
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -639,13 +909,31 @@ ExecStart=/usr/local/bin/nebula -config /etc/nebula/config.yml
 Restart=always
 RestartSec=5
 
+RuntimeDirectory=nebula
+LogsDirectory=nebula
+
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
+    ensure_service_dirs
     deploy_services || { log_err "service deployment failed"; exit 2; }
 
-    systemctl enable nebula --now || log_warn "nebula.service could not be started yet (certificates pending?)"
+    systemctl restart nebula || log_warn "nebula restart returned non-zero"
+
+    local EXPECTED_IP
+    EXPECTED_IP="${NODE_IP%%/*}"
+
+    verify_nebula_runtime "nebula0" "${EXPECTED_IP}" "4242" || {
+        log_err "Nebula runtime verification failed. Halting before reporting success."
+        exit 2
+    }
 
     if command -v pipx >/dev/null; then
         pipx install --force pydantic pyyaml requests "requests[socks]" instructor ollama rich semgrep || \
