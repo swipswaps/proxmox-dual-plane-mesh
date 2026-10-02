@@ -152,11 +152,16 @@ fi
 LOCAL_VERIFY="$(read_verification local)"
 LOCAL_COMMIT="no-change"
 if git fetch origin > /dev/null 2>&1; then
-    if ! git diff --quiet origin/main HEAD; then
-        LOCAL_COMMIT="pushed"
+    if git rev-parse --verify --quiet origin/main > /dev/null; then
+        if ! git diff --quiet origin/main HEAD; then
+            LOCAL_COMMIT="pushed"
+        fi
+    else
+        LOCAL_COMMIT="unknown:no-upstream"
     fi
 else
     log_warn "git fetch failed; cannot determine commit state"
+    LOCAL_COMMIT="unknown:fetch-failed"
 fi
 
 log_info "local.verification = ${LOCAL_VERIFY}"
