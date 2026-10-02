@@ -288,7 +288,7 @@ install_dashboards() {
     local guser="$1" ggroup="$2"
     local entry id name url raw final
 
-    for entry in "1860:node-exporter-full" "2:prometheus-stats" "7587:blackbox-exporter"; do
+    for entry in "1860:node-exporter-full" "7587:blackbox-exporter"; do
         id="${entry%%:*}"
         name="${entry##*:}"
         url="https://grafana.com/api/dashboards/${id}/revisions/latest/download"
