@@ -32,6 +32,7 @@ PEER_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --local-only)   MODE="local"; shift ;;
+        --all)          MODE="all"; shift ;;
         --status)       MODE="status"; shift ;;
         --require-peer) REQUIRE_PEER=1; shift ;;
         --peer)         PEER_OVERRIDE="$2"; shift 2 ;;
@@ -151,16 +152,11 @@ fi
 LOCAL_VERIFY="$(read_verification local)"
 LOCAL_COMMIT="no-change"
 if git fetch origin > /dev/null 2>&1; then
-    if git rev-parse --verify --quiet origin/main > /dev/null ; then
-        if ! git diff --quiet origin/main HEAD ; then
-            LOCAL_COMMIT="pushed"
-        fi
-    else
-        LOCAL_COMMIT="unknown:no-upstream"
+    if ! git diff --quiet origin/main HEAD; then
+        LOCAL_COMMIT="pushed"
     fi
 else
     log_warn "git fetch failed; cannot determine commit state"
-    LOCAL_COMMIT="unknown:fetch-failed"
 fi
 
 log_info "local.verification = ${LOCAL_VERIFY}"
@@ -168,6 +164,49 @@ log_info "local.commit       = ${LOCAL_COMMIT}"
 
 PEER_VERIFY="unreachable"
 PEER_COMMIT="unreachable"
+
+if [[ "${MODE}" == "all" ]] && [[ -f /etc/nebula/peers ]]; then
+    PEERS_FILE="/etc/nebula/peers"
+    if [[ ! -s "${PEERS_FILE}" ]]; then
+        log_err "BLOCK: ${PEERS_FILE} empty"
+        exit 2
+    fi
+
+    SSH_AS=""
+    [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]] && SSH_AS="${SUDO_USER}"
+    if [[ -n "${SSH_AS}" ]]; then
+        SSH_PREFIX=(sudo -u "${SSH_AS}" -H ssh)
+    else
+        SSH_PREFIX=(ssh)
+    fi
+
+    ANY_FAIL=0
+    while IFS= read -r peer_entry; do
+        [[ -z "${peer_entry}" ]] && continue
+        [[ "${peer_entry:0:1}" == "#" ]] && continue
+        log_step "Peer: ${peer_entry}"
+        if ! "${SSH_PREFIX[@]}" -o BatchMode=yes -o ConnectTimeout=5 "${peer_entry}" "true"; then
+            log_warn "unreachable: ${peer_entry}"
+            continue
+        fi
+        if "${SSH_PREFIX[@]}" -t "${peer_entry}" \
+                "cd ${REPO_ROOT} && git pull --ff-only && sudo ${FIX} --no-push"; then
+            v="$(read_verification "${peer_entry}")"
+            log_info "${peer_entry}: ${v}"
+            [[ "${v}" != "pass" ]] && ANY_FAIL=1
+        else
+            log_warn "${peer_entry}: ssh-command failed"
+            ANY_FAIL=1
+        fi
+    done < "${PEERS_FILE}"
+
+    if (( ANY_FAIL == 1 )); then
+        log_err "BLOCK: at least one peer failed"
+        exit 2
+    fi
+    log_info "ACCEPT: all peers pass"
+    exit 0
+fi
 
 if [[ "${MODE}" == "both" ]] && [[ -n "${PEER}" ]]; then
     log_step "Peer: reachability to ${PEER}"
