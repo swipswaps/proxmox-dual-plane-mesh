@@ -34,7 +34,14 @@ cd "$REPO" || { printf 'cannot cd %s\n' "$REPO"; exit 0; }
 
 hr()  { printf '\n== %s ==\n' "$1"; }
 say() { printf '  %s\n' "$1"; }
-run() { if [ "$DRY" = "1" ]; then printf '  [dry] %s\n' "$*"; else "$@"; fi; }
+run() {
+  if [ "$DRY" = "1" ]; then
+    printf '  [dry] %s\n' "$*"
+    return 0
+  fi
+  "$@"
+  return $?
+}
 
 hr "0. identity"
 say "host:       $(hostname -s)"
