@@ -32,6 +32,19 @@ if [[ $EUID -ne 0 ]]; then
     exit 3
 fi
 
+NO_PUSH=0
+for arg in "$@"; do
+    case "${arg}" in
+        --no-push) NO_PUSH=1 ;;
+        --help|-h)
+            echo "Usage: $0 [--no-push]"
+            echo "  --no-push  perform all local actions but skip git commit and push"
+            exit 0
+            ;;
+        *) log_warn "ignoring unknown argument: ${arg}" ;;
+    esac
+done
+
 DASH_DIR="/var/lib/grafana/dashboards"
 DB="/var/lib/grafana/grafana.db"
 QUARANTINE_ROOT="/var/lib/grafana/quarantine"
@@ -317,6 +330,8 @@ git add scripts/mesh-observability.sh
 
 if git diff --cached --quiet ; then
     log_info "no staged changes; skipping commit"
+elif (( NO_PUSH == 1 )) ; then
+    log_info "--no-push set; changes staged but not committed"
 else
     if ! git commit -m "mesh-observability: drop dashboard id 2, superseded and schema-incompatible" ; then
         log_err "git commit failed"
