@@ -7,22 +7,32 @@ STATE_DIR="$HOME/.local/state/mesh-recover"
 mkdir -p "$STATE_DIR"
 
 CERT="/etc/nebula/host.crt"
-if [ ! -f "$CERT" ]; then
-  printf 'mesh-cert-check: %s not found; nothing to check\n' "$CERT"
+
+if [ ! -e "$CERT" ]; then
+  printf 'mesh-cert-check: %s absent\n' "$CERT"
   exit 0
 fi
 
-# nebula-cert may need sudo to read; try without first
+# try direct read; if that fails try non-interactive sudo
 RAW="$(/usr/local/bin/nebula-cert print -path "$CERT" 2>&1)"
 if ! printf '%s\n' "$RAW" | grep -qF 'Not After'; then
   RAW="$(sudo -n /usr/local/bin/nebula-cert print -path "$CERT" 2>&1)"
 fi
+
 if ! printf '%s\n' "$RAW" | grep -qF 'Not After'; then
-  printf 'mesh-cert-check: could not read cert (needs sudo without password or run manually)\n'
+  # distinguish "cannot read" from "not there"
+  if [ -r "$CERT" ]; then
+    printf 'mesh-cert-check: %s exists but nebula-cert output was unexpected\n' "$CERT"
+  else
+    printf 'mesh-cert-check: cannot read %s as %s (needs sudoers grant for nebula-cert)\n' "$CERT" "$(id -un)"
+  fi
   exit 0
 fi
 
-EXPIRES_STR="$(printf '%s\n' "$RAW" | awk '/Not After/{sub(/^.*Not After: /,""); sub(/ -0400 EDT.*/,""); print}')"
+EXPIRES_STR="$(printf '%s\n' "$RAW" | awk '/Not After/{sub(/^.*Not After: /,""); print; exit}')"
+# strip any trailing timezone annotation
+EXPIRES_STR="$(printf '%s\n' "$EXPIRES_STR" | sed -E 's/ [A-Z]{3,4}.*$//')"
+
 if [ -z "$EXPIRES_STR" ]; then
   printf 'mesh-cert-check: could not parse Not After line\n'
   exit 0
