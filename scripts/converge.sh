@@ -56,9 +56,9 @@ say "dry-run:    $DRY"
 if [ -z "$PEER_IP" ]; then
   hr "1. peer autodetect (LAN first, then overlay)"
   for cand in \
+      10.100.0.1 10.100.0.2 10.100.0.3 10.100.0.4 \
       192.168.4.24 192.168.4.25 192.168.4.26 192.168.4.27 \
-      192.168.4.45 192.168.4.46 192.168.4.47 192.168.4.48 \
-      10.100.0.1 10.100.0.2 10.100.0.3 10.100.0.4; do
+      192.168.4.45 192.168.4.46 192.168.4.47 192.168.4.48; do
     [ "$cand" = "$SELF_LAN" ] && continue
     [ "$cand" = "$SELF_OVERLAY" ] && continue
     if ping -c 1 -W 1 "$cand" >/dev/null; then
