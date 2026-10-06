@@ -330,6 +330,35 @@ if ! systemctl --user is-enabled --quiet mesh-recover.timer; then
   systemctl --user enable mesh-recover.timer 2>&1 | tee -a "$LOG"
 fi
 
+# ── check 8: Yggdrasil fallback (last resort, never preferred) ───────
+# Runs ONLY when nebula + LAN both failed. Ygg needs no lighthouse, no
+# hole punching, no rendezvous — pure DHT routing over outbound TCP
+# peerings. Peer address from /etc/mesh-ygg-peer (written at install).
+# Latency is worse; availability is the point.
+YGG_OK=0
+if [ "$OVL_OK" = "0" ] && [ "$LAN_OK" = "0" ]; then
+  if ! ip -6 -o addr show dev ygg0 2>&1 | grep -q 'inet6 2'; then
+    log "check8: no ygg0 address (daemon down? needs systemd unit); skipping"
+  elif [ ! -f /etc/mesh-ygg-peer ]; then
+    log "check8: no /etc/mesh-ygg-peer file; skipping (write peer Ygg IPv6 there)"
+  else
+    YGG_PEER="$(cat /etc/mesh-ygg-peer 2>&1 | head -n 1)"
+    case "$YGG_PEER" in
+      *:*)
+        if timeout 20 ssh -6 -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=8 "owner@$YGG_PEER" hostname >/dev/null 2>&1; then
+          YGG_OK=1
+          log "check8: ssh over Yggdrasil ok (fallback plane)"
+        else
+          log "check8: Yggdrasil up but peer SSH failed"
+        fi
+        ;;
+      *)
+        log "check8: bad peer file content; skipping"
+        ;;
+    esac
+  fi
+fi
+
 # ── verdict ──────────────────────────────────────────────────────────────
 if [ "$OVL_OK" = "1" ] && [ "$SSH_OVL_OK" = "1" ]; then
   rm -f "$STATE_DIR/last-failure"
@@ -337,8 +366,11 @@ if [ "$OVL_OK" = "1" ] && [ "$SSH_OVL_OK" = "1" ]; then
 elif [ "$LAN_OK" = "1" ]; then
   rm -f "$STATE_DIR/last-failure"
   log "verdict: overlay down, LAN fallback healthy"
+elif [ "$YGG_OK" = "1" ]; then
+  rm -f "$STATE_DIR/last-failure"
+  log "verdict: nebula+LAN down, Yggdrasil fallback healthy"
 else
-  mark "all planes down: ovl=$OVL_OK ssh_ovl=$SSH_OVL_OK lan=$LAN_OK"
+  mark "all planes down: ovl=$OVL_OK ssh_ovl=$SSH_OVL_OK lan=$LAN_OK ygg=$YGG_OK"
 fi
 
 # ── bench: latency/congestion record (observability, never gates) ──────
