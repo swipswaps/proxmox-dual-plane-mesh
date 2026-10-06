@@ -259,9 +259,14 @@ if [ "$OVL_OK" = "1" ]; then
       fi
     elif [ "$SCAN_BYTES" = "0" ]; then
       log "check3: peer unreachable (empty scan); keeping known_hosts untouched"
+    elif ssh-keygen -F "$PEER_OVL" 2>&1 | grep -q 'found:'; then
+      # A known host presenting a DIFFERENT uncertified key is either a
+      # reinstall or an impersonator. An unattended loop must not decide
+      # which: fail closed, alert loudly, keep the old entry.
+      log "check3: KEY CHANGED for known host $PEER_OVL with no cert; NOT refreshing (operator decision required)"
+      mark "ssh host key changed without cert: $PEER_OVL"
     else
-      log "check3: peer presents no cert; legacy known_hosts refresh"
-      ssh-keygen -R "$PEER_OVL" 2>&1 | tee -a "$LOG"
+      log "check3: first contact, no cert; one-time TOFU refresh"
       ssh-keyscan -T 5 -t ed25519,rsa "$PEER_OVL" >> "$HOME/.ssh/known_hosts" 2>&1 | tee -a "$LOG"
     fi
     if timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 "owner@$PEER_OVL" hostname >/dev/null 2>&1; then
