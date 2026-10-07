@@ -55,12 +55,14 @@ print('HOSTS:', hosts)
 
 restart_checked() {
     BACK="$BACKDIR/backup-$(date -u +%Y%m%dT%H%M%SZ)" || return 2
-    mkdir -p "$BACKDIR" || return 2
-    cp "$CONF" "$BACK/last-good-check.yml" 2>&1 || true
-    if ! nebula -test -config "$CONF" 2>&1 | head -n 3; then
-        fail 'nebula -test unhappy; config untouched by restart'
+    mkdir -p "$BACK" || return 2
+    cp "$CONF" "$BACK/pre-restart.yml" || return 2
+    TESTLOG="$BACK/netest.log" || return 2
+    if ! nebula -test -config "$CONF" > "$TESTLOG" 2>&1; then
+        fail "nebula -test unhappy; see $TESTLOG; config untouched by restart"
         return 2
     fi
+    printf 'nebula -test clean\n'
     systemctl restart nebula || return 2
     sleep 5
     if systemctl is-active --quiet nebula; then
