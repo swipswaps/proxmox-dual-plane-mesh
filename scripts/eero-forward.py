@@ -76,10 +76,12 @@ async def cmd_devices(net):
     c = client()
     async with c:
         r = await c.get_devices(net)
-        devs = r.get("data", {}).get("devices", r.get("data", []))
+        devs = r.get("data", [])
         if isinstance(devs, dict):
-            devs = [devs]
+            devs = devs.get("devices", [devs])
         for d in devs:
+            if not isinstance(d, dict):
+                continue
             print(d.get("hostname", d.get("nickname", "?")), "|",
                   d.get("ip"), "|", d.get("mac"))
 
@@ -92,6 +94,8 @@ async def cmd_forwards(net):
         if isinstance(items, dict):
             items = [items]
         for f in items:
+            if not isinstance(f, dict):
+                continue
             print(f.get("id"), "|", f.get("description"), "|",
                   f.get("protocol"), f.get("gateway_port"),
                   "->", f.get("ip"), f.get("client_port"))
@@ -103,9 +107,13 @@ async def cmd_add(net, ip, gw, cli, proto, desc):
         body = {"client_port": int(cli), "description": desc,
                 "enabled": True, "gateway_port": int(gw),
                 "ip": ip, "protocol": proto.lower()}
-        r = await c.create_forward(net, body)
+        r = await c.create_forward(body, net)
         d = r.get("data", {})
-        print("CREATED", d.get("id"), "|", d.get("description"))
+        blob = str(d)
+        import re as _re
+        m = _re.search(r"'id': '([^']+)'", blob)
+        print("CREATED", m.group(1) if m else d.get("id"),
+              "|", d.get("description"))
 
 
 async def cmd_delete(net, fid, yes):
@@ -113,7 +121,7 @@ async def cmd_delete(net, fid, yes):
         fail("refusing without --yes (two-word confirm pattern)")
     c = client()
     async with c:
-        await c.delete_forward(net, fid)
+        await c.delete_forward(fid, net)
         print("DELETED", fid)
 
 
