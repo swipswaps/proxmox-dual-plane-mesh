@@ -5,4 +5,5 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-%h/.local/share/mesh-duckdns.env
 ExecStart=%h/Documents/d565411ff353dd7f/repo/proxmox-dual-plane-mesh/scripts/duckdns-update.sh --update %i

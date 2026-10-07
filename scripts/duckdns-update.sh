@@ -11,6 +11,7 @@
 set -uo pipefail
 
 STORE="/etc/mesh-duckdns.env"
+USER_STORE="${HOME}/.local/share/mesh-duckdns.env"
 LOG_DIR="${HOME}/.local/state/duckdns"
 
 fail() {
@@ -19,6 +20,10 @@ fail() {
 }
 
 load_auth() {
+    if [ -z "${DUCKDNS_TOKEN:-}" ] && [ -f "$USER_STORE" ]; then
+        # shellcheck disable=SC1090
+        . "$USER_STORE" || return 2
+    fi
     if [ -z "${DUCKDNS_TOKEN:-}" ] && [ -f "$STORE" ]; then
         if [ ! -r "$STORE" ]; then
             fail "store $STORE is root-only; re-run with sudo"
