@@ -59,7 +59,9 @@ restart_checked() {
     cp "$CONF" "$BACK/pre-restart.yml" || return 2
     TESTLOG="$BACK/netest.log" || return 2
     if ! nebula -test -config "$CONF" > "$TESTLOG" 2>&1; then
-        fail "nebula -test unhappy; see $TESTLOG; config untouched by restart"
+        printf '--- nebula -test errors ---\n'
+        grep -E "level=(error|fatal)" "$TESTLOG" 2>&1 | head -n 5 || true
+        fail "nebula -test unhappy; full log at $TESTLOG; config untouched by restart"
         return 2
     fi
     printf 'nebula -test clean\n'
