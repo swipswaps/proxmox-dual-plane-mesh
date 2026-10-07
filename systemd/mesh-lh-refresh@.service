@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh nebula public lighthouse path from DuckDNS (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/owner/Documents/d565411ff353dd7f/repo/proxmox-dual-plane-mesh/scripts/mesh-lh-refresh.sh %i 4242

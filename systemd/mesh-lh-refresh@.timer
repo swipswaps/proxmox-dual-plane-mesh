@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh nebula public lighthouse path hourly
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+Unit=mesh-lh-refresh@%i.service
+
+[Install]
+WantedBy=timers.target
