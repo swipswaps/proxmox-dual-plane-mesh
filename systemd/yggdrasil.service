@@ -1,0 +1,17 @@
+[Unit]
+Description=Yggdrasil mesh fallback plane (last resort after nebula+LAN)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Binary installed once per host:
+#   sudo install -m 0755 /tmp/yggdrasil /usr/local/bin/yggdrasil
+# Config built by ygg-genconf.sh (e26eb081 workstream), installed:
+#   sudo install -m 0600 /tmp/ygg-<host>-final.json /etc/yggdrasil.conf
+ExecStart=/usr/local/bin/yggdrasil -useconffile /etc/yggdrasil.conf
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
