@@ -39,7 +39,7 @@ need_root() {
 
 edit_hosts() {
     MODE="$1"; HOST="$2"; PORT="$3"
-    if printf '%s' "$HOST" | grep -qE '[^0-9.]'; then
+    if [ "$MODE" = "add" ] && printf '%s' "$HOST" | grep -qE '[^0-9.]'; then
         fail "nebula 1.9.5 lighthouse.hosts takes IP literals only ($HOST rejected); use --set-public with the resolved IP"
         return 2
     fi
