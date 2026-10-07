@@ -1,0 +1,8 @@
+[Unit]
+Description=Mesh registry heartbeat (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/Documents/d565411ff353dd7f/repo/proxmox-dual-plane-mesh/scripts/mesh-heartbeat.sh %i
