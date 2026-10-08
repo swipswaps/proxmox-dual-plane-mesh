@@ -9,6 +9,9 @@
 #   join-b64-file <path>           Client: install from base64 file
 #   join-from <user@host> [name]   Client: fetch bundle over SSH, then join
 #   shred <name>                   Lighthouse: destroy a bundle
+#   shred-remote <user@host> <name>
+#                                  Anywhere: shred a lighthouse bundle over
+#                                  SSH (mesh IP works off-LAN), with receipt
 #   verify [peer-ip]               Both: verify mesh health with evidence
 #   latency [peer-ip] [--peer-ssh user@host]
 #                                  Both: RFC 6349/5357 latency audit
@@ -657,6 +660,47 @@ cmd_shred() {
     exit 0
 }
 
+cmd_shred_remote() {
+    need_root "$@"
+    [[ $# -eq 2 ]] || die_usage "usage: $0 shred-remote <user@host> <name>  (host may be the mesh IP, e.g. owner@10.100.0.1)"
+
+    local spec="$1" name="$2"
+    case "${name}" in
+        ''|*[!A-Za-z0-9_.-]*) die_usage "bad bundle name: ${name}" ;;
+    esac
+    local ssh_user host port
+    ssh_user="${spec%%@*}"
+    host="${spec#*@}"
+    port=22
+    if [[ "${host}" == *:* ]]; then
+        port="${host##*:}"
+        host="${host%%:*}"
+    fi
+    [[ -z "${ssh_user}" ]] && ssh_user="$(detect_operator_user)"
+
+    setup_ssh_ctl "${ssh_user}" "${host}" "${port}" || die_fail "SSH setup failed"
+
+    # Shred runs as root on the far end (sudo password prompts there, not
+    # here). One receipt line on success; anything remaining fails loudly.
+    local remote
+    remote="for f in ${OFFER_ROOT}/${name}.tar.gz ${OFFER_ROOT}/${name}.b64; do if [ -e \"\$f\" ]; then shred -u \"\$f\" || rm -f \"\$f\"; fi; done; for f in ${OFFER_ROOT}/${name}.tar.gz ${OFFER_ROOT}/${name}.b64; do if [ -e \"\$f\" ]; then echo \"REMAINS \$f\"; exit 3; fi; done; echo 'SHREDDED ${name} (tgz+b64 gone from lighthouse)'"
+    local out rc=0
+    if [[ -t 0 ]]; then
+        out="$(ssh -tt -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'" 2>&1)" || rc=$?
+    else
+        out="$(ssh -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'" 2>&1)" || rc=$?
+    fi
+    teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
+    printf '%s\n' "${out}"
+    if (( rc != 0 )); then
+        die_fail "remote shred failed (rc=${rc})"
+    fi
+    case "${out}" in
+        *SHREDDED*) log_info "remote shred confirmed" ;;
+        *) die_fail "remote shred unverified" ;;
+    esac
+}
+
 # --------------------------------------------------------------------------
 # verify — full certificate dump
 # --------------------------------------------------------------------------
@@ -831,6 +875,7 @@ Commands:
   join-b64-file <path>              Client: install from base64 file
   join-from <user@host> [name]      Client: fetch bundle over SSH, then join
   shred <name>                      Lighthouse: destroy a bundle
+  shred-remote <user@host> <name>   Anywhere: shred it over SSH + receipt
   verify [peer-ip]                  Both: verify mesh health with evidence
   latency [peer-ip] [--peer-ssh u@h]
                                     Both: RFC 6349/5357 latency audit
@@ -852,6 +897,7 @@ case "$1" in
     join-b64-file) shift; cmd_join_b64_file "$@" ;;
     join-from)     shift; cmd_join_from "$@" ;;
     shred)         shift; cmd_shred "$@" ;;
+    shred-remote)  shift; cmd_shred_remote "$@" ;;
     verify)        shift; cmd_verify "$@" ;;
     latency)       shift; cmd_latency "$@" ;;
     audit)         shift; cmd_audit "$@" ;;
