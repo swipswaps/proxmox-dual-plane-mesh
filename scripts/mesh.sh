@@ -3,11 +3,16 @@
 # mesh.sh — unified Nebula mesh management
 #
 # Commands:
-#   onboard <name> [ip] [groups]   Lighthouse: sign cert, build one-file bundle
+#   onboard <name> [ip] [groups] [mid]
+#                                  Lighthouse: sign cert, build one-file bundle
+#                                  (mid = node's /etc/machine-id[0:8] or more;
+#                                  unknown by default; clones refused)
 #   join <bundle-file>             Client: install from local bundle (+lh refresher)
 #   join-b64 <base64-string>       Client: install from inline base64
 #   join-b64-file <path>           Client: install from base64 file
-#   join-from <user@host> [name]   Client: fetch bundle over SSH, then join
+#   join-from <user@host> [name] [--via-lan]
+#                                  Client: fetch bundle over SSH, then join
+#   nodes                          Lighthouse: list onboarded nodes
 #   shred <name>                   Lighthouse: destroy a bundle
 #   shred-remote <user@host> <name>
 #                                  Anywhere: shred a lighthouse bundle over
@@ -16,7 +21,8 @@
 #   latency [peer-ip] [--peer-ssh user@host]
 #                                  Both: RFC 6349/5357 latency audit
 #   audit                          Both: constraints + diagnostics
-#   update                         Both: safe repo update
+#   update [--check]               Both: safe repo update (check = dry report)
+#   install-helpers                Both: mesh on PATH + passwordless remote ops
 #   help                           Show usage
 #
 # Exit codes: 0 success, 2 recoverable failure, 3 usage error.
@@ -79,6 +85,25 @@ is_lighthouse() {
 # Peers registry for mesh-recover.sh: one bare mesh IP per line,
 # world-readable (mesh IPs are not secret). Written at onboard/join.
 PEERS_FILE="/var/lib/mesh/peers"
+
+# Fail closed on LAN-addressed remote ops: LAN IPs are leases, not
+# identities (proved by the .24→.30 roam). Mesh IPs (10.100.x) and
+# loopback always pass; anything else needs an explicit --via-lan.
+lan_guard() {
+    local host="$1" flag="$2"
+    case "$host" in
+        10.100.*|127.*|localhost) return 0 ;;
+        192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
+        *) return 0 ;;
+    esac
+    if [ "$flag" = "1" ]; then
+        log_warn "LAN target ${host} explicitly allowed (--via-lan)"
+        return 0
+    fi
+    log_err "refusing LAN target ${host}: mesh IPs are identities, LAN IPs are leases"
+    log_err "use --via-lan to override (first-time join before the mesh exists)"
+    return 2
+}
 record_mesh_peer() {
     local ip="${1%%/*}"
     [[ -n "${ip}" ]] || return 0
@@ -236,6 +261,7 @@ cmd_onboard() {
     local name="${1:-}"
     local ip="${2:-}"
     local groups="${3:-}"
+    local mid="${4:-unknown}"
 
     if [[ -z "${name}" ]]; then
         echo ""
@@ -314,6 +340,24 @@ ENVEOF
     local op_user; op_user="$(detect_operator_user)"
     chown "${op_user}:${op_user}" "${bundle_tgz}" "${bundle_b64}" || true
     chmod 600 "${bundle_tgz}" "${bundle_b64}"
+
+    # Node registry: name + mesh IP + machine-id (or unknown). A mid
+    # already registered under a DIFFERENT name means a cloned image:
+    # refuse to silently double-book it.
+    local reg="/var/lib/mesh/nodes"
+    mkdir -p "$(dirname "${reg}")" || die_fail "mkdir registry failed"
+    touch "${reg}" || die_fail "touch registry failed"
+    chmod 644 "${reg}" || die_fail "chmod registry failed"
+    if [[ "${mid}" != "unknown" ]]; then
+        local clash
+        clash="$(awk -v m="${mid}" -v n="${name}" '$3 == m && $1 != n {print $1; exit}' "${reg}" 2>&1)" || clash=""
+        if [[ -n "${clash}" ]]; then
+            die_fail "machine-id ${mid} already registered as ${clash}: cloned image? regenerate with systemd-machine-id-setup, then re-onboard"
+        fi
+    fi
+    awk -v n="${name}" '$1 != n' "${reg}" > "${reg}.tmp" || die_fail "registry rewrite failed"
+    printf '%s %s %s %s\n' "${name}" "${ip}" "${mid}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${reg}.tmp" || die_fail "registry write failed"
+    mv "${reg}.tmp" "${reg}" || die_fail "registry replace failed"
 
     local tgz_size b64_size
     tgz_size="$(stat -c%s "${bundle_tgz}")"
@@ -536,11 +580,21 @@ CFGEOF
     # does not strand this node. Warn-only; join already succeeded.
     install_lh_refresher "${LIGHTHOUSE_HOSTNAME:-}"
 
+    # Stable software identity: human name + machine-id suffix (never raw
+    # hardware serials). Printed for eero nicknames + onboard registry.
+    local my_mid="unknown"
+    if [[ -r /etc/machine-id ]]; then
+        my_mid="$(cut -c1-8 /etc/machine-id 2>&1)" || my_mid="unknown"
+        printf '%s\n' "${my_mid}" > /etc/nebula/node-id 2>&1 || true
+        chmod 644 /etc/nebula/node-id 2>&1 || true
+    fi
+
     echo ""
     log_bold "=== Joined ==="
     echo ""
     echo "  Node name   : ${NODE_NAME}"
     echo "  Mesh IP     : ${NODE_IP}"
+    echo "  Node ID     : ${NODE_NAME}-${my_mid}  (use for eero nickname: ensure-lab ... ${NODE_NAME} --mid ${my_mid})"
     echo "  Lighthouse  : ${LIGHTHOUSE_MESH} via ${use}"
     echo ""
     log_bold "Next:"
@@ -578,10 +632,17 @@ cmd_join_b64_file() {
 
 cmd_join_from() {
     need_root "$@"
-    [[ $# -ge 1 ]] || die_usage "usage: $0 join-from <user@host> [node-name]"
+    [[ $# -ge 1 ]] || die_usage "usage: $0 join-from <user@host> [node-name] [--via-lan]"
 
-    local spec="$1"
-    local name="${2:-$(hostname -s || echo client)}"
+    local via_lan=0 args=()
+    local a
+    for a in "$@"; do
+        if [[ "$a" == "--via-lan" ]]; then via_lan=1; else args+=("$a"); fi
+    done
+    [[ "${#args[@]}" -ge 1 ]] || die_usage "usage: $0 join-from <user@host> [node-name] [--via-lan]"
+
+    local spec="${args[0]}"
+    local name="${args[1]:-$(hostname -s || echo client)}"
     local ssh_user host port
     ssh_user="${spec%%@*}"
     host="${spec#*@}"
@@ -592,6 +653,8 @@ cmd_join_from() {
         host="${host%%:*}"
     fi
     [[ -z "${ssh_user}" ]] && ssh_user="$(detect_operator_user)"
+
+    lan_guard "${host}" "${via_lan}" || return 2
 
     setup_ssh_ctl "${ssh_user}" "${host}" "${port}" || die_fail "SSH setup failed"
 
@@ -630,6 +693,20 @@ cmd_join_from() {
 }
 
 # --------------------------------------------------------------------------
+# nodes — list the onboard registry (name, mesh IP, machine-id, date)
+# --------------------------------------------------------------------------
+
+cmd_nodes() {
+    local reg="/var/lib/mesh/nodes"
+    if [[ ! -f "${reg}" ]]; then
+        log_warn "no registry yet (onboard a node first)"
+        exit 2
+    fi
+    printf '%-16s %-14s %-12s %s\n' "NAME" "MESH-IP" "MACHINE-ID" "ONBOARDED"
+    cat "${reg}" 2>&1 | awk 'NF{printf "%-16s %-14s %-12s %s\n", $1, $2, $3, $4}' || exit 2
+}
+
+# --------------------------------------------------------------------------
 # shred
 # --------------------------------------------------------------------------
 
@@ -659,12 +736,18 @@ cmd_shred() {
     fi
     exit 0
 }
-
 cmd_shred_remote() {
     need_root "$@"
-    [[ $# -eq 2 ]] || die_usage "usage: $0 shred-remote <user@host> <name>  (host may be the mesh IP, e.g. owner@10.100.0.1)"
+    [[ $# -ge 2 ]] || die_usage "usage: $0 shred-remote <user@host> <name> [--via-lan]  (mesh IP works off-LAN)"
 
-    local spec="$1" name="$2"
+    local via_lan=0 args=()
+    local a
+    for a in "$@"; do
+        if [[ "$a" == "--via-lan" ]]; then via_lan=1; else args+=("$a"); fi
+    done
+    [[ "${#args[@]}" -eq 2 ]] || die_usage "usage: $0 shred-remote <user@host> <name> [--via-lan]"
+
+    local spec="${args[0]}" name="${args[1]}"
     case "${name}" in
         ''|*[!A-Za-z0-9_.-]*) die_usage "bad bundle name: ${name}" ;;
     esac
@@ -672,11 +755,14 @@ cmd_shred_remote() {
     ssh_user="${spec%%@*}"
     host="${spec#*@}"
     port=22
+
     if [[ "${host}" == *:* ]]; then
         port="${host##*:}"
         host="${host%%:*}"
     fi
     [[ -z "${ssh_user}" ]] && ssh_user="$(detect_operator_user)"
+
+    lan_guard "${host}" "${via_lan}" || return 2
 
     setup_ssh_ctl "${ssh_user}" "${host}" "${port}" \
         || die_fail "SSH setup failed (is the lighthouse reachable? ping ${host})"
@@ -692,11 +778,31 @@ cmd_shred_remote() {
     # interactive `ssh -t` session with plain `sudo`, so prompt and input
     # share a single tty (split across sessions breaks under Fedora's
     # default per-tty ticket setting).
-    local out rc=0
-    if ssh -o "ControlPath=${MESH_SSH_CTL}" -o "ConnectTimeout=10" -p "${port}" \
-        "${ssh_user}@${host}" "sudo -n true" > /dev/null 2>&1; then
-        out="$(ssh -o "ControlPath=${MESH_SSH_CTL}" -o "ConnectTimeout=10" -p "${port}" "${ssh_user}@${host}" "sudo -n sh -c '${remote}'" 2>&1)" || rc=$?
-    elif [[ -t 0 ]] && command -v timeout > /dev/null; then
+    local out rc=0 probe=""
+    # Preferred: prepared hosts run the root-owned validator passwordless
+    # (`mesh.sh install-helpers` on the far end). Fully non-interactive.
+    # Receipts only (SHREDDED:/NOSUCH:/REMAINS:); anything else means the
+    # helper is absent/unauthorized and we fall through to interactive.
+    probe="$(ssh -o "ControlPath=${MESH_SSH_CTL}" -o "ConnectTimeout=10" -p "${port}" \
+        "${ssh_user}@${host}" "sudo -n /usr/local/bin/mesh-remote-shred '${name}'" 2>&1)" || true
+    case "${probe}" in
+        SHREDDED:*)
+            out="${probe}"
+            log_info "remote shred confirmed (helper, no passwords typed)"
+            teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
+            return 0
+            ;;
+        NOSUCH:*)
+            teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
+            log_warn "no bundle ${name} on ${host}"
+            exit 2
+            ;;
+        REMAINS:*)
+            teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
+            die_fail "remote shred incomplete: ${probe}"
+            ;;
+    esac
+    if [[ -t 0 ]] && command -v timeout > /dev/null; then
         # Interactive leg: NO output capture. A captured $(...) swallows
         # the sudo prompt into a buffer (silent stall); uncaptured, prompt
         # and keystrokes share the live terminal. The remote script exits
@@ -723,6 +829,72 @@ cmd_shred_remote() {
         *SHREDDED*) log_info "remote shred confirmed" ;;
         *) die_fail "remote shred unverified" ;;
     esac
+}
+
+# --------------------------------------------------------------------------
+# install-helpers — one-shot per machine: `mesh` on PATH, remote shred
+# without passwords, safe updates. Idempotent; prints what changed.
+# The sudoers line names ONE root-owned validator (name allow-listed
+# inside); shred-remote then runs fully non-interactive. Interactive
+# fallback stays for unprepared hosts.
+# --------------------------------------------------------------------------
+
+cmd_install_helpers() {
+    need_root "$@"
+
+    log_step " symlink /usr/local/bin/mesh"
+    local me
+    me="$(readlink -f "${BASH_SOURCE[0]}")" || die_fail "cannot resolve self"
+    [[ -x "${me}" ]] || die_fail "self not executable: ${me}"
+    ln -sf "${me}" /usr/local/bin/mesh || die_fail "symlink failed"
+    log_info "mesh -> ${me}"
+
+    log_step " validator /usr/local/bin/mesh-remote-shred"
+    cat > /usr/local/bin/mesh-remote-shred << 'HELPEOF'
+#!/usr/bin/env bash
+# mesh-remote-shred — shred exactly one lighthouse bundle. Name is
+# allow-listed; receipts only (SHREDDED:/REMAINS:/NOSUCH:), inputs never
+# echoed back. Called via scoped NOPASSWD sudo (see /etc/sudoers.d/mesh-remote).
+set -uo pipefail
+name="${1:-}"
+case "${name}" in
+    ''|*[!A-Za-z0-9_.-]*) printf 'FAIL: bad bundle name\n' >&2; exit 3 ;;
+esac
+base="/var/lib/mesh-onboard/offers/${name}"
+found=0
+for ext in tar.gz b64; do
+    if [ -e "${base}.${ext}" ]; then
+        shred -u "${base}.${ext}" || rm -f "${base}.${ext}"
+        found=1
+    fi
+done
+if (( found == 0 )); then
+    printf 'NOSUCH:%s\n' "${name}"
+    exit 2
+fi
+for ext in tar.gz b64; do
+    if [ -e "${base}.${ext}" ]; then
+        printf 'REMAINS:%s.%s\n' "${name}" "${ext}"
+        exit 3
+    fi
+done
+printf 'SHREDDED:%s\n' "${name}"
+HELPEOF
+    chmod 0700 /usr/local/bin/mesh-remote-shred || die_fail "chmod helper failed"
+    chown root:root /usr/local/bin/mesh-remote-shred || die_fail "chown helper failed"
+
+    log_step " sudoers /etc/sudoers.d/mesh-remote"
+    local grp="sudo"
+    if [ -f /etc/fedora-release ] || [ -f /etc/redhat-release ]; then
+        grp="wheel"
+    fi
+    printf '%%%s ALL=(root) NOPASSWD: /usr/local/bin/mesh-remote-shred *\n' "${grp}" > /etc/sudoers.d/mesh-remote \
+        || die_fail "sudoers write failed"
+    chmod 0440 /etc/sudoers.d/mesh-remote || die_fail "sudoers chmod failed"
+    if command -v visudo > /dev/null; then
+        visudo -c -f /etc/sudoers.d/mesh-remote 2>&1 || die_fail "sudoers invalid"
+    fi
+    log_info "helpers installed (wrapper 0700 root, sudoers validated)"
 }
 
 # --------------------------------------------------------------------------
@@ -850,6 +1022,31 @@ cmd_audit() {
 # --------------------------------------------------------------------------
 
 cmd_update() {
+    # update --check: dry report, machine-readable exits (0 current+clean,
+    # 2 behind or dirty). Never touches the tree: safe for .45-style trees
+    # with local work (refuses instead of stashing).
+    if [[ "${1:-}" == "--check" ]]; then
+        [[ -d "${REPO_ROOT}/.git" ]] || { log_err "not a git checkout"; exit 2; }
+        cd "${REPO_ROOT}"
+        local branch head upstream dirty="clean"
+        branch="$(git rev-parse --abbrev-ref HEAD)"
+        head="$(git rev-parse --short HEAD)"
+        if ! git diff --quiet --exit-code || ! git diff --cached --quiet --exit-code; then
+            dirty="dirty($(git status --short | head -n 5 | tr '\n' ' '))"
+        fi
+        git fetch origin > /dev/null 2>&1 || { log_err "fetch failed"; exit 2; }
+        upstream="$(git rev-parse --short "origin/${branch}" 2>&1)" || upstream="unknown"
+        local behind=0
+        if [[ "${upstream}" != "unknown" ]]; then
+            behind="$(git rev-list --count "${head}..origin/${branch}" 2>&1)" || behind=0
+        fi
+        printf 'branch=%s head=%s upstream=%s behind=%s tree=%s\n' "${branch}" "${head}" "${upstream}" "${behind}" "${dirty}"
+        if [[ "${dirty}" != "clean" ]] || [[ "${behind}" != "0" ]]; then
+            exit 2
+        fi
+        exit 0
+    fi
+
     log_step "Checking repository state"
     if [[ ! -d "${REPO_ROOT}/.git" ]]; then
         log_err "${REPO_ROOT} is not a git checkout."
@@ -869,6 +1066,10 @@ cmd_update() {
 
     if ! git diff --quiet --exit-code || ! git diff --cached --quiet --exit-code; then
         log_warn "Uncommitted changes present."
+        if [[ ! -t 0 ]]; then
+            log_warn "Aborted (non-interactive): commit, stash, or run with a tty first."
+            exit 2
+        fi
         read -rp "Stash local changes and continue? [y/N]: " yn
         if [[ "${yn}" != "y" ]]; then
             log_warn "Aborted. Commit or discard your changes first."
@@ -893,18 +1094,23 @@ usage() {
 mesh.sh — unified Nebula mesh management
 
 Commands:
-  onboard <name> [ip] [groups]      Lighthouse: sign cert, build one-file bundle
+  onboard <name> [ip] [groups] [mid]
+                                    Lighthouse: sign cert, build one-file bundle
+  nodes                             Lighthouse: list onboarded nodes
   join <bundle-file>                Client: install from local bundle
   join-b64 <base64-string>          Client: install from inline base64
   join-b64-file <path>              Client: install from base64 file
-  join-from <user@host> [name]      Client: fetch bundle over SSH, then join
+  join-from <user@host> [name] [--via-lan]
+                                    Client: fetch bundle over SSH, then join
   shred <name>                      Lighthouse: destroy a bundle
-  shred-remote <user@host> <name>   Anywhere: shred it over SSH + receipt
+  shred-remote <user@host> <name> [--via-lan]
+                                    Anywhere: shred it over SSH + receipt
   verify [peer-ip]                  Both: verify mesh health with evidence
   latency [peer-ip] [--peer-ssh u@h]
                                     Both: RFC 6349/5357 latency audit
   audit                             Both: constraints + diagnostics
-  update                            Both: safe repo update
+  update [--check]                  Both: safe repo update (check = dry report)
+  install-helpers                   Both: mesh on PATH + passwordless remote ops
   help                              This message
 USAGEEOF
 }
@@ -920,12 +1126,14 @@ case "$1" in
     join-b64)      shift; cmd_join_b64 "$@" ;;
     join-b64-file) shift; cmd_join_b64_file "$@" ;;
     join-from)     shift; cmd_join_from "$@" ;;
+    nodes)         shift; cmd_nodes "$@" ;;
     shred)         shift; cmd_shred "$@" ;;
     shred-remote)  shift; cmd_shred_remote "$@" ;;
     verify)        shift; cmd_verify "$@" ;;
     latency)       shift; cmd_latency "$@" ;;
     audit)         shift; cmd_audit "$@" ;;
     update)        shift; cmd_update "$@" ;;
+    install-helpers) shift; cmd_install_helpers "$@" ;;
     help|--help|-h) usage; exit 0 ;;
     *) die_usage "unknown command: $1 (see: $0 help)" ;;
 esac
