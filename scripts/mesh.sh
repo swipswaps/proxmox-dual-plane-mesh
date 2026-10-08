@@ -693,12 +693,20 @@ cmd_shred_remote() {
     # share a single tty (split across sessions breaks under Fedora's
     # default per-tty ticket setting).
     local out rc=0
-    if ssh -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" \
+    if ssh -o "ControlPath=${MESH_SSH_CTL}" -o "ConnectTimeout=10" -p "${port}" \
         "${ssh_user}@${host}" "sudo -n true" > /dev/null 2>&1; then
-        out="$(ssh -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" "${ssh_user}@${host}" "sudo -n sh -c '${remote}'" 2>&1)" || rc=$?
-    elif [[ -t 0 ]]; then
-        log_step "Authorizing sudo on ${host} (password prompts here)"
-        out="$(ssh -t -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'" 2>&1)" || rc=$?
+        out="$(ssh -o "ControlPath=${MESH_SSH_CTL}" -o "ConnectTimeout=10" -p "${port}" "${ssh_user}@${host}" "sudo -n sh -c '${remote}'" 2>&1)" || rc=$?
+    elif [[ -t 0 ]] && command -v timeout > /dev/null; then
+        # Interactive leg runs OUTSIDE the multiplex master: pty over a
+        # muxed channel swallows the sudo prompt (silent stall). Direct
+        # connection + single -t keeps prompt and input on one terminal.
+        # 120s guard turns a missed prompt into a message, not a hang.
+        log_step "Remote sudo on ${host}: type the REMOTE password below (120s)"
+        out="$(timeout 120 ssh -t -o "ControlPath=none" -o "ConnectTimeout=10" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'" 2>&1)" || rc=$?
+        if (( rc == 124 )); then
+            teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
+            die_fail "timed out waiting for the remote sudo password"
+        fi
     else
         teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
         die_fail "remote sudo needs a password but stdin is not a tty"
