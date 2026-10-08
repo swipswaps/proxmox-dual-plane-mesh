@@ -73,6 +73,21 @@ is_lighthouse() {
     [[ -f /etc/nebula/ca.key ]] && [[ -f /etc/nebula/ca.crt ]]
 }
 
+# Peers registry for mesh-recover.sh: one bare mesh IP per line,
+# world-readable (mesh IPs are not secret). Written at onboard/join.
+PEERS_FILE="/var/lib/mesh/peers"
+record_mesh_peer() {
+    local ip="${1%%/*}"
+    [[ -n "${ip}" ]] || return 0
+    mkdir -p "$(dirname "${PEERS_FILE}")" || return 0
+    touch "${PEERS_FILE}" || return 0
+    chmod 644 "${PEERS_FILE}" || return 0
+    if ! grep -qxF "${ip}" "${PEERS_FILE}" 2>&1; then
+        printf '%s\n' "${ip}" >> "${PEERS_FILE}" || return 0
+    fi
+    return 0
+}
+
 detect_operator_user() {
     echo "${SUDO_USER:-root}"
 }
@@ -269,6 +284,9 @@ cmd_onboard() {
 
     cp /etc/nebula/ca.crt "${stage}/ca.crt" || die_fail "copy ca.crt failed"
 
+    record_mesh_peer "${ip}"
+    log_info "Recorded ${ip%%/*} in ${PEERS_FILE} (recover health targets)"
+
     cat > "${stage}/offer.env" << ENVEOF
 NODE_NAME=${name}
 NODE_IP=${ip}
@@ -409,6 +427,9 @@ join_from_bundle() {
         use="${LIGHTHOUSE_LAN:-10.100.0.1}"
     fi
     log_info "Using Lighthouse address: ${use}"
+
+    record_mesh_peer "${LIGHTHOUSE_MESH:-10.100.0.1}"
+    log_info "Recorded lighthouse in ${PEERS_FILE} (recover health targets)"
 
     systemctl stop nebula >/dev/null 2>&1 || true
 

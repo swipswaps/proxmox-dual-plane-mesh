@@ -25,11 +25,24 @@ mark() {
 SELF_OVL="$(ip -4 -o addr show nebula0 2>&1 | awk '/inet /{split($4,a,"/"); print a[1]; exit}')"
 SELF_LAN="$(ip -4 -o addr show 2>&1 | awk '$4 ~ /^192\.168\./ {split($4,a,"/"); print a[1]; exit}')"
 
-case "$SELF_OVL" in
-  10.100.0.1) PEER_OVL=10.100.0.2; PEER_LAN_HINT=192.168.4.24 ;;
-  10.100.0.2) PEER_OVL=10.100.0.1; PEER_LAN_HINT=192.168.4.45 ;;
-  *)          PEER_OVL=""; PEER_LAN_HINT="" ;;
-esac
+# Peer list: /var/lib/mesh/peers (one bare mesh IP per line, maintained
+# by mesh.sh onboard/join) wins; legacy static mapping fills gaps for
+# nodes enrolled before the peers file existed. SELF is always excluded,
+# so a retired identity can never become a health target again.
+PEERS_FILE="/var/lib/mesh/peers"
+derive_peers() {
+    local legacy=""
+    case "$SELF_OVL" in
+      10.100.0.1)  legacy=10.100.0.24; PEER_LAN_HINT=192.168.4.24 ;;
+      10.100.0.24) legacy=10.100.0.1;  PEER_LAN_HINT=192.168.4.45 ;;
+      10.100.0.2)  legacy=10.100.0.1;  PEER_LAN_HINT=192.168.4.45 ;;
+      *)           legacy=""; PEER_LAN_HINT="" ;;
+    esac
+    PEER_OVLS="$( { [ -r "$PEERS_FILE" ] && grep -E '^[0-9.]+$' "$PEERS_FILE"; printf '%s\n' "$legacy"; } 2>&1 | awk -v self="$SELF_OVL" 'NF && $1 != self && !seen[$1]++' | head -n 16 | tr '\n' ' ' )"
+    PEER_OVL="$(printf '%s' "$PEER_OVLS" | awk '{print $1}')"
+}
+PEER_OVL=""; PEER_OVLS=""; PEER_LAN_HINT=""
+derive_peers
 
 PEER_LAN=""
 if [ -n "$PEER_LAN_HINT" ] && ping -c 1 -W 1 "$PEER_LAN_HINT" >/dev/null; then
@@ -97,11 +110,7 @@ if [ -z "$SELF_OVL" ]; then
     date +%s > "$RESTART_STAMP" 2>&1 || true
     sleep 10
     SELF_OVL="$(ip -4 -o addr show nebula0 2>&1 | awk '/inet /{split($4,a,"/"); print a[1]; exit}')"
-    case "$SELF_OVL" in
-      10.100.0.1) PEER_OVL=10.100.0.2; PEER_LAN_HINT=192.168.4.24 ;;
-      10.100.0.2) PEER_OVL=10.100.0.1; PEER_LAN_HINT=192.168.4.45 ;;
-      *)          PEER_OVL=""; PEER_LAN_HINT="" ;;
-    esac
+    derive_peers
     log "check1b: re-probed self ovl=${SELF_OVL:-none}"
   fi
 fi
@@ -114,14 +123,23 @@ OVL_OK=0
 tcp22_ok() {
   timeout 5 bash -c "</dev/tcp/$1/22" 2>&1
 }
-if [ -n "$PEER_OVL" ]; then
-  if ping -c 2 -W 2 "$PEER_OVL" >/dev/null; then
-    OVL_OK=1
-    log "check2: overlay ping ok"
-  elif tcp22_ok "$PEER_OVL"; then
-    OVL_OK=1
-    log "check2: overlay ping filtered, TCP/22 ok (no restart)"
-  else
+if [ -n "$PEER_OVLS" ]; then
+  for cand in $PEER_OVLS; do
+    if ping -c 2 -W 2 "$cand" >/dev/null; then
+      OVL_OK=1
+      PEER_OVL="$cand"
+      log "check2: overlay ping ok via $cand"
+      break
+    elif tcp22_ok "$cand"; then
+      OVL_OK=1
+      PEER_OVL="$cand"
+      log "check2: overlay ping filtered, TCP/22 ok via $cand (no restart)"
+      break
+    else
+      log "check2: peer $cand unreachable, trying next"
+    fi
+  done
+  if [ "$OVL_OK" = "0" ]; then
     # Rate guard: trigger storms (nmcli cycle, DHCP flap) spawn a recover
     # per event; without this each one restarts nebula. Observed 15
     # restarts in 3 min on .24. Skip if one happened <120s ago.
@@ -133,17 +151,22 @@ if [ -n "$PEER_OVL" ]; then
       case "$LAST_S" in ''|*[!0-9]*) LAST_S=0 ;; esac
     fi
     if [ "$((NOW_S - LAST_S))" -lt 120 ]; then
-      log "check2: overlay ping failed; restarted $((NOW_S - LAST_S))s ago, skipping restart (rate guard)"
+      log "check2: all peers failed; restarted $((NOW_S - LAST_S))s ago, skipping restart (rate guard)"
     else
-      log "check2: overlay ping failed; restarting nebula"
+      log "check2: all peers failed ($PEER_OVLS); restarting nebula"
       sudo -n systemctl restart nebula 2>&1 | tee -a "$LOG"
       date +%s > "$RESTART_STAMP" 2>&1 || true
     fi
     sleep 8
-    if ping -c 2 -W 2 "$PEER_OVL" >/dev/null; then
-      OVL_OK=1
-      log "check2: recovered after restart"
-    else
+    for cand in $PEER_OVLS; do
+      if ping -c 2 -W 2 "$cand" >/dev/null; then
+        OVL_OK=1
+        PEER_OVL="$cand"
+        log "check2: recovered after restart via $cand"
+        break
+      fi
+    done
+    if [ "$OVL_OK" = "0" ]; then
       log "check2: still dead"
     fi
   fi
