@@ -678,12 +678,15 @@ cmd_shred_remote() {
     fi
     [[ -z "${ssh_user}" ]] && ssh_user="$(detect_operator_user)"
 
-    setup_ssh_ctl "${ssh_user}" "${host}" "${port}" || die_fail "SSH setup failed"
+    setup_ssh_ctl "${ssh_user}" "${host}" "${port}" \
+        || die_fail "SSH setup failed (is the lighthouse reachable? ping ${host})"
 
     # Shred runs as root on the far end (sudo password prompts there, not
     # here). One receipt line on success; anything remaining fails loudly.
+    # NOTE: no inner single-quotes below — the whole script ships inside
+    # '...' to the far end, where an inner quote would terminate it early.
     local remote
-    remote="for f in ${OFFER_ROOT}/${name}.tar.gz ${OFFER_ROOT}/${name}.b64; do if [ -e \"\$f\" ]; then shred -u \"\$f\" || rm -f \"\$f\"; fi; done; for f in ${OFFER_ROOT}/${name}.tar.gz ${OFFER_ROOT}/${name}.b64; do if [ -e \"\$f\" ]; then echo \"REMAINS \$f\"; exit 3; fi; done; echo 'SHREDDED ${name} (tgz+b64 gone from lighthouse)'"
+    remote="for f in ${OFFER_ROOT}/${name}.tar.gz ${OFFER_ROOT}/${name}.b64; do if [ -e \"\$f\" ]; then shred -u \"\$f\" || rm -f \"\$f\"; fi; done; for f in ${OFFER_ROOT}/${name}.tar.gz ${OFFER_ROOT}/${name}.b64; do if [ -e \"\$f\" ]; then echo REMAINS:\$f; exit 3; fi; done; echo SHREDDED:${name}:tgz+b64-gone"
     local out rc=0
     if [[ -t 0 ]]; then
         out="$(ssh -tt -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'" 2>&1)" || rc=$?
