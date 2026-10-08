@@ -5,4 +5,4 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/owner/Documents/d565411ff353dd7f/repo/proxmox-dual-plane-mesh/scripts/mesh-lh-refresh.sh %i 4242
+ExecStart=/usr/local/bin/mesh-lh-refresh.sh %i 4242

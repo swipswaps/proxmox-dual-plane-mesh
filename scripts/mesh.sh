@@ -4,7 +4,7 @@
 #
 # Commands:
 #   onboard <name> [ip] [groups]   Lighthouse: sign cert, build one-file bundle
-#   join <bundle-file>             Client: install from local bundle
+#   join <bundle-file>             Client: install from local bundle (+lh refresher)
 #   join-b64 <base64-string>       Client: install from inline base64
 #   join-b64-file <path>           Client: install from base64 file
 #   join-from <user@host> [name]   Client: fetch bundle over SSH, then join
@@ -233,10 +233,11 @@ cmd_onboard() {
         groups="${groups:-agents,telemetry}"
     fi
 
-    local mesh_ip lan_ip public_ip
+    local mesh_ip lan_ip public_ip lh_host
     mesh_ip="$(detect_mesh_ip)"
     lan_ip="$(detect_lan_ip)"
     public_ip="$(detect_public_ip)"
+    lh_host="${MESH_LH_HOSTNAME:-mesh-lh01.duckdns.org}"
     local cgnat=0
     is_cgnat "${public_ip}" && cgnat=1
 
@@ -246,6 +247,7 @@ cmd_onboard() {
     log_info "Mesh IP    : ${mesh_ip}"
     log_info "LAN IP     : ${lan_ip:-<unknown>}"
     log_info "Public IP  : ${public_ip:-<unknown>}"
+    log_info "LH DNS     : ${lh_host} (override: MESH_LH_HOSTNAME=...)"
     if (( cgnat == 1 )); then
         log_warn "Public IP is in CGNAT range; internet reachability requires a VPS or Tor."
     fi
@@ -274,6 +276,7 @@ NODE_GROUPS=${groups}
 LIGHTHOUSE_MESH=${mesh_ip}
 LIGHTHOUSE_LAN=${lan_ip}
 LIGHTHOUSE_PUBLIC=${public_ip}
+LIGHTHOUSE_HOSTNAME=${lh_host}
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ENVEOF
 
@@ -321,6 +324,52 @@ ENVEOF
     log_bold "Shred the bundle after the client has joined:"
     echo "  sudo ./scripts/mesh.sh shred ${name}"
     echo ""
+}
+
+# --------------------------------------------------------------------------
+# lighthouse-path refresher (roaming nodes)
+# --------------------------------------------------------------------------
+
+install_lh_refresher() {
+    local host="$1"
+    if [[ -z "${host}" ]]; then
+        log_warn "no LIGHTHOUSE_HOSTNAME in bundle; skipping public-path refresher"
+        log_warn "roaming nodes need it: re-onboard (sets default mesh-lh01.duckdns.org)"
+        return 0
+    fi
+    local src="${SELF_DIR}/mesh-lh-refresh.sh"
+    if [[ ! -f "${src}" ]]; then
+        log_warn "mesh-lh-refresh.sh not beside mesh.sh; skipping refresher"
+        return 0
+    fi
+    log_step "Installing lighthouse-path refresher for ${host}"
+    install -o root -g root -m 755 "${src}" /usr/local/bin/mesh-lh-refresh.sh \
+        || { log_warn "refresher script install failed"; return 0; }
+    # Render units from repo templates with the stable path (no sed: python3).
+    python3 - "${REPO_ROOT}/systemd/mesh-lh-refresh@.service" << 'PYEOF' \
+        || { log_warn "refresher unit render failed"; return 0; }
+import sys
+with open(sys.argv[1]) as f:
+    body = f.read()
+lines = []
+for ln in body.splitlines():
+    if ln.startswith("ExecStart="):
+        lines.append("ExecStart=/usr/local/bin/mesh-lh-refresh.sh %i 4242")
+    else:
+        lines.append(ln)
+with open("/etc/systemd/system/mesh-lh-refresh@.service", "w") as f:
+    f.write("\n".join(lines) + "\n")
+PYEOF
+    cp "${REPO_ROOT}/systemd/mesh-lh-refresh@.timer" \
+        /etc/systemd/system/mesh-lh-refresh@.timer \
+        || { log_warn "refresher timer install failed"; return 0; }
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now "mesh-lh-refresh@${host}.timer" >/dev/null 2>&1; then
+        log_info "refresher active: mesh-lh-refresh@${host}.timer (hourly)"
+    else
+        log_warn "refresher timer enable failed; public path will go stale on WAN change"
+    fi
+    return 0
 }
 
 # --------------------------------------------------------------------------
@@ -459,6 +508,10 @@ CFGEOF
     else
         log_warn "Ping to Lighthouse ${peer} failed"
     fi
+
+    # Roaming survival: track the DuckDNS name so a home-WAN change
+    # does not strand this node. Warn-only; join already succeeded.
+    install_lh_refresher "${LIGHTHOUSE_HOSTNAME:-}"
 
     echo ""
     log_bold "=== Joined ==="
