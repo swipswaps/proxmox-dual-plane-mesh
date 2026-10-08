@@ -56,6 +56,19 @@ fi
 
 log "self ovl=$SELF_OVL lan=$SELF_LAN peer ovl=$PEER_OVL lan=${PEER_LAN:-none}"
 
+# ── check 0a: loopback up (found 2026-10-08: .45 ran days with lo DOWN —
+# every self-ping failed while remote traffic worked, masking diagnostics
+# and breaking all localhost consumers). Best-effort repair via sudo -n.
+if ! ip link show lo 2>&1 | grep -q "state UP"; then
+  log "check0a: lo not UP; attempting repair"
+  sudo -n ip link set lo up 2>&1 | tee -a "$LOG" || log "check0a: repair refused (needs sudo); run: sudo ip link set lo up"
+  if ip link show lo 2>&1 | grep -q "state UP"; then
+    log "check0a: lo restored"
+  else
+    mark "loopback down and repair refused"
+  fi
+fi
+
 # ── check 0: docker bridge addresses (daemon-level decay) ──────────────
 # Found 2026-10-05: after nmcli cycling, br-ae4bce23142d carried NO IPv4
 # address. Host->container routing died while every container stayed up
