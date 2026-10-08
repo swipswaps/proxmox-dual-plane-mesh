@@ -687,12 +687,18 @@ cmd_shred_remote() {
     # '...' to the far end, where an inner quote would terminate it early.
     local remote
     remote="for f in ${OFFER_ROOT}/${name}.tar.gz ${OFFER_ROOT}/${name}.b64; do if [ -e \"\$f\" ]; then shred -u \"\$f\" || rm -f \"\$f\"; fi; done; for f in ${OFFER_ROOT}/${name}.tar.gz ${OFFER_ROOT}/${name}.b64; do if [ -e \"\$f\" ]; then echo REMAINS:\$f; exit 3; fi; done; echo SHREDDED:${name}:tgz+b64-gone"
+    # Two-phase remote sudo: first an interactive `sudo -v` on its own
+    # tty (password prompts vanish inside multiplexed capture), then the
+    # real command runs passwordless with `sudo -n` and fails fast with a
+    # clear message if the timestamp did not stick.
     local out rc=0
     if [[ -t 0 ]]; then
-        out="$(ssh -tt -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'" 2>&1)" || rc=$?
-    else
-        out="$(ssh -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'" 2>&1)" || rc=$?
+        log_step "Authorizing sudo on ${host} (password prompts here)"
+        ssh -t -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" \
+            "${ssh_user}@${host}" "sudo -v" 2>&1 \
+            || { teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"; die_fail "remote sudo auth failed"; }
     fi
+    out="$(ssh -o "ControlPath=${MESH_SSH_CTL}" -p "${port}" "${ssh_user}@${host}" "sudo -n sh -c '${remote}'" 2>&1)" || rc=$?
     teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
     printf '%s\n' "${out}"
     if (( rc != 0 )); then
