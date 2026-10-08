@@ -697,16 +697,19 @@ cmd_shred_remote() {
         "${ssh_user}@${host}" "sudo -n true" > /dev/null 2>&1; then
         out="$(ssh -o "ControlPath=${MESH_SSH_CTL}" -o "ConnectTimeout=10" -p "${port}" "${ssh_user}@${host}" "sudo -n sh -c '${remote}'" 2>&1)" || rc=$?
     elif [[ -t 0 ]] && command -v timeout > /dev/null; then
-        # Interactive leg runs OUTSIDE the multiplex master: pty over a
-        # muxed channel swallows the sudo prompt (silent stall). Direct
-        # connection + single -t keeps prompt and input on one terminal.
-        # 120s guard turns a missed prompt into a message, not a hang.
+        # Interactive leg: NO output capture. A captured $(...) swallows
+        # the sudo prompt into a buffer (silent stall); uncaptured, prompt
+        # and keystrokes share the live terminal. The remote script exits
+        # 0 only after verifying both files gone (3 if anything remains),
+        # so the ssh exit code alone is the receipt.
         log_step "Remote sudo on ${host}: type the REMOTE password below (120s)"
-        out="$(timeout 120 ssh -t -o "ControlPath=none" -o "ConnectTimeout=10" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'" 2>&1)" || rc=$?
+        timeout 120 ssh -t -o "ControlPath=none" -o "ConnectTimeout=10" -p "${port}" "${ssh_user}@${host}" "sudo sh -c '${remote}'"
+        rc=$?
         if (( rc == 124 )); then
             teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
             die_fail "timed out waiting for the remote sudo password"
         fi
+        out="SHREDDED (live session, rc=${rc})"
     else
         teardown_ssh_ctl "${ssh_user}" "${host}" "${port}"
         die_fail "remote sudo needs a password but stdin is not a tty"
