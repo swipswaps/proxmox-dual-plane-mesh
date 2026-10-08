@@ -333,9 +333,8 @@ ENVEOF
 install_lh_refresher() {
     local host="$1"
     if [[ -z "${host}" ]]; then
-        log_warn "no LIGHTHOUSE_HOSTNAME in bundle; skipping public-path refresher"
-        log_warn "roaming nodes need it: re-onboard (sets default mesh-lh01.duckdns.org)"
-        return 0
+        host="mesh-lh01.duckdns.org"
+        log_warn "no LIGHTHOUSE_HOSTNAME in bundle (pre-upgrade onboard); defaulting to ${host}"
     fi
     local src="${SELF_DIR}/mesh-lh-refresh.sh"
     if [[ ! -f "${src}" ]]; then
@@ -576,6 +575,11 @@ cmd_join_from() {
     local local_bundle
     local_bundle="$(mktemp --suffix=.tar.gz)"
     cleanup_add "${local_bundle}"
+    # mktemp makes a root-owned 600 file, but the fetch below runs as the
+    # invoking user (sudo -u) to reuse their SSH keys — hand them ownership.
+    if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+        chown "${SUDO_USER}:${SUDO_USER}" "${local_bundle}" || die_fail "chown bundle failed"
+    fi
 
     log_step "Retrieving ${ssh_user}@${host}:${remote_bundle}"
     local scp_prefix
