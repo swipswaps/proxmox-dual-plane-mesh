@@ -55,6 +55,15 @@ main() {
 
     local suspect=0
 
+    # One bounded journal pass into tempfiles (repeated full scans wedged
+    # slow hosts); sections 4-7 all read them. --no-pager: never block.
+    local scan
+    scan="$(mktemp)" || { fail "mktemp failed"; return 2; }
+    journalctl --since "$SINCE" --no-pager > "$scan" 2>&1 || true
+    local nbscan
+    nbscan="$(mktemp)" || { fail "mktemp failed"; rm -f "$scan"; return 2; }
+    journalctl --since "$SINCE" --no-pager -u nebula > "$nbscan" 2>&1 || true
+
     printf '\n=== 1. adapter ===\n'
     lspci -nnk 2>&1 | grep -i -A3 -E "network|wireless|wlan|broadcom|intel.*wireless|realtek|atheros|mediatek" | head -n 12 || true
     printf 'driver: '
@@ -99,20 +108,24 @@ main() {
     iw dev "$ifc" link 2>&1 | head -n 12 || true
 
     printf '\n=== 4. carrier flaps (counters, since boot) ===\n'
-    printf 'carrier_up=%s carrier_down=%s dormant=%s\n' \
-        "$(cat "/sys/class/net/$ifc/carrier_up_count" 2>&1)" \
-        "$(cat "/sys/class/net/$ifc/carrier_down_count" 2>&1)" \
-        "$(cat "/sys/class/net/$ifc/dormant" 2>&1)"
+    local cup cdown
+    cup="$(cat "/sys/class/net/$ifc/carrier_up_count" 2>&1)"
+    cdown="$(cat "/sys/class/net/$ifc/carrier_down_count" 2>&1)"
+    printf 'carrier_up=%s carrier_down=%s dormant=%s uptime_boot=%s\n' \
+        "$cup" "$cdown" "$(cat "/sys/class/net/$ifc/dormant" 2>&1)" \
+        "$(uptime -s 2>&1)"
     ip -s link show "$ifc" 2>&1 | grep -E "RX:|TX:|errors|dropped" | head -n 6 || true
-
-    # One bounded journal pass into a tempfile (three full scans wedged
-    # slow hosts); sections 5-7 all read the file. --no-pager: never block.
-    local scan
-    scan="$(mktemp)" || { fail "mktemp failed"; return 2; }
-    journalctl --since "$SINCE" --no-pager > "$scan" 2>&1 || true
-    local nbscan
-    nbscan="$(mktemp)" || { fail "mktemp failed"; rm -f "$scan"; return 2; }
-    journalctl --since "$SINCE" --no-pager -u nebula > "$nbscan" 2>&1 || true
+    printf 'flap timestamps in window:\n'
+    grep -i -E "$ifc.*(link .*not ready|carrier|deauth|disassoc|connected|disconnected)" "$scan" \
+        | head -n 15 || true
+    case "${cdown:-0}" in
+        ''|*[!0-9]*) printf 'carrier counters unreadable\n' ;;
+        *)
+            if [ "$cdown" -gt 5 ]; then
+                warn "carrier_down=$cdown since boot: link is bouncing (power, roam, or driver)"
+                suspect=1
+            fi ;;
+    esac
 
     printf '\n=== 5. disconnect history (journal since %s) ===\n' "$SINCE"
     local drops
@@ -132,8 +145,17 @@ main() {
     grep -c -E 'Close tunnel|Handshake timed out|Caught signal' "$nbscan" || true
     grep -E 'Close tunnel|Handshake timed out|Caught signal|Started nebula' "$nbscan" \
         | head -n 10 || true
-    printf 'nebula restarts since boot: '
-    systemctl show -p NRestarts --value nebula 2>&1 || printf '(query failed)\n'
+    local nrest
+    nrest="$(systemctl show -p NRestarts --value nebula 2>&1)" || nrest="(query failed)"
+    printf 'nebula restarts since boot: %s\n' "$nrest"
+    case "$nrest" in
+        ''|*[!0-9]*) printf '(restarts unreadable)\n' ;;
+        *)
+            if [ "$nrest" -gt 2 ]; then
+                warn "nebula restarted $nrest times since boot: flapping lighthouse"
+                suspect=1
+            fi ;;
+    esac
 
     rm -f "$scan" "$nbscan"
     printf '\n=== verdict ===\n'
