@@ -315,6 +315,7 @@ cmd_onboard() {
 
     record_mesh_peer "${ip}"
     log_info "Recorded ${ip%%/*} in ${PEERS_FILE} (recover health targets)"
+    inventory_refresh
 
     cat > "${stage}/offer.env" << ENVEOF
 NODE_NAME=${name}
@@ -477,6 +478,7 @@ join_from_bundle() {
 
     record_mesh_peer "${LIGHTHOUSE_MESH:-10.100.0.1}"
     log_info "Recorded lighthouse in ${PEERS_FILE} (recover health targets)"
+    inventory_refresh
 
     systemctl stop nebula >/dev/null 2>&1 || true
 
@@ -690,6 +692,24 @@ cmd_join_from() {
     fi
 
     join_from_bundle "${local_bundle}"
+}
+
+# --------------------------------------------------------------------------
+# inventory — mesh-owned SQLite ops DB (nodes, peers, eero, findings).
+# Passthrough to mesh-inventory.py; flat files stay the source of truth,
+# onboard/join refresh the DB best-effort (warn-only, never fatal).
+# --------------------------------------------------------------------------
+
+cmd_inventory() {
+    [[ -x "${SELF_DIR}/mesh-inventory.py" ]] || die_fail "mesh-inventory.py not found or not executable"
+    "${SELF_DIR}/mesh-inventory.py" "$@"
+}
+
+inventory_refresh() {
+    if [[ -x "${SELF_DIR}/mesh-inventory.py" ]]; then
+        "${SELF_DIR}/mesh-inventory.py" import-local > /dev/null 2>&1 \
+            || log_warn "inventory refresh failed (non-fatal)"
+    fi
 }
 
 # --------------------------------------------------------------------------
@@ -1097,6 +1117,7 @@ Commands:
   onboard <name> [ip] [groups] [mid]
                                     Lighthouse: sign cert, build one-file bundle
   nodes                             Lighthouse: list onboarded nodes
+  inventory <args>                  Both: inventory DB (init/import/sync/findings)
   join <bundle-file>                Client: install from local bundle
   join-b64 <base64-string>          Client: install from inline base64
   join-b64-file <path>              Client: install from base64 file
@@ -1127,6 +1148,7 @@ case "$1" in
     join-b64-file) shift; cmd_join_b64_file "$@" ;;
     join-from)     shift; cmd_join_from "$@" ;;
     nodes)         shift; cmd_nodes "$@" ;;
+    inventory)     shift; cmd_inventory "$@" ;;
     shred)         shift; cmd_shred "$@" ;;
     shred-remote)  shift; cmd_shred_remote "$@" ;;
     verify)        shift; cmd_verify "$@" ;;
