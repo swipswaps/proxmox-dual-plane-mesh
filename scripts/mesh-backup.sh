@@ -263,7 +263,8 @@ main() {
     pfile="$(mktemp)" || die_fail "mktemp passfile failed"
     chmod 600 "${pfile}" || die_fail "chmod passfile failed"
     printf '%s' "${PASS}" > "${pfile}" 2>&1 || die_fail "write passfile failed"
-    # shellcheck disable=SC2086 (cipher is a fixed internal pair, never input)
+    # cipher is a fixed internal pair, never input
+    # shellcheck disable=SC2086
     if ! tar -czf - -C "${stage}" . 2>&1 | openssl enc ${cipher} -pass "file:${pfile}" -out "${bundle}" 2>&1; then
         shred -u "${pfile}" 2>&1 || rm -f "${pfile}"
         die_fail "encrypt failed"
@@ -292,7 +293,8 @@ main() {
     chmod 600 "${vpfile}" || die_fail "chmod verify passfile failed"
     printf '%s' "${vpass}" > "${vpfile}" 2>&1 || die_fail "write verify passfile failed"
     vpass="x"
-    # shellcheck disable=SC2086 (cipher is a fixed internal pair, never input)
+    # cipher is a fixed internal pair, never input
+    # shellcheck disable=SC2086
     if ! openssl enc -d ${cipher} -pass "file:${vpfile}" -in "${bundle}" 2>&1 | tar -xzf - -C "${vdir}" 2>&1; then
         shred -u "${vpfile}" 2>&1 || rm -f "${vpfile}"
         die_fail "VERIFY FAILED: bundle does not decrypt (kept for inspection: ${bundle})"
