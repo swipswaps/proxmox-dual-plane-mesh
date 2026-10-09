@@ -337,17 +337,28 @@ main() {
                 log_warn "LAN scp target explicitly allowed (--via-lan)"
                 ;;
         esac
+        # Identity: the working SSH identity (keys, known_hosts) belongs to
+        # the invoking user, not root (join-from learned this the same way:
+        # root-run scp dies on auth while the user's succeeds). Hand the
+        # user the bundle, then do everything as them.
+        local ssh_cmd=(ssh) scp_cmd=(scp)
+        if [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
+            chown "${SUDO_USER}:${SUDO_USER}" "${bundle}" "${bundle%.enc}.manifest" \
+                || die_fail "chown bundle to ${SUDO_USER} failed"
+            ssh_cmd=(sudo -u "${SUDO_USER}" -H ssh)
+            scp_cmd=(sudo -u "${SUDO_USER}" -H scp)
+        fi
         # scp never creates remote dirs: make it first as the same user.
         # Prefer a user-writable landing zone (~/mesh-backups/); system
         # paths like /var/lib/mesh need remote root and fail here loudly.
         local ruserhost="${SCP_DEST%%:*}" rdir="${SCP_DEST#*:}" rdir_q
         rdir_q="$(printf '%q' "${rdir}")"
         log_step "Preparing remote dir on ${ruserhost}"
-        if ! ssh -o "ConnectTimeout=10" "${ruserhost}" "mkdir -p -- ${rdir_q}" 2>&1; then
+        if ! "${ssh_cmd[@]}" -o "ConnectTimeout=10" "${ruserhost}" "mkdir -p -- ${rdir_q}" 2>&1; then
             die_fail "remote mkdir failed (need ${ruserhost} writable path? try ~/mesh-backups/)"
         fi
         log_step "Copying bundle + manifest off-host: ${SCP_DEST}"
-        scp "${bundle}" "${bundle%.enc}.manifest" "${SCP_DEST}" 2>&1 || die_fail "scp failed"
+        "${scp_cmd[@]}" "${bundle}" "${bundle%.enc}.manifest" "${SCP_DEST}" 2>&1 || die_fail "scp failed"
         log_info "off-host copy done"
     fi
 
