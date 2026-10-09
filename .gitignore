@@ -11,3 +11,6 @@ ca.key
 host.key
 *.crt
 *.pem
+
+# RustDesk server keypair (private key has no extension)
+data/rustdesk/

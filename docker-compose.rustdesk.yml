@@ -1,0 +1,32 @@
+# RustDesk self-hosted rendezvous (hbbs) + relay (hbbr).
+# The relay fallback is the documented answer to "no router access,
+# hostile NAT": both ends dial out, relay carries what hole punching
+# cannot. E2E encrypted; relay sees ciphertext only.
+#
+#   docker compose -f docker-compose.rustdesk.yml up -d
+#   ./scripts/rustdesk-provision.sh init     # waits for keypair, records it
+#
+# Ports: 21115/tcp+udp (hbbs rendezvous), 21116/tcp+udp (hbbs NAT test),
+# 21117/tcp (hbbr relay). The rendezvous host must be reachable; relay
+# traffic also exits here. Data (keys) lives in ./data/rustdesk (gitignored).
+services:
+  hbbs:
+    image: rustdesk/rustdesk-server:latest
+    container_name: mesh-rustdesk-hbbs
+    command: hbbs
+    volumes:
+      - ./data/rustdesk:/root
+    ports:
+      - "21115:21115"
+      - "21116:21116"
+      - "21116:21116/udp"
+    restart: unless-stopped
+  hbbr:
+    image: rustdesk/rustdesk-server:latest
+    container_name: mesh-rustdesk-hbbr
+    command: hbbr
+    volumes:
+      - ./data/rustdesk:/root
+    ports:
+      - "21117:21117"
+    restart: unless-stopped
