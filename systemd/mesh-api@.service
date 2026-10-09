@@ -1,0 +1,14 @@
+[Unit]
+Description=Mesh read API for the portal (port %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mesh-api --port %i
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

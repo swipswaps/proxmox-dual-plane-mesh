@@ -713,6 +713,35 @@ inventory_refresh() {
 }
 
 # --------------------------------------------------------------------------
+# api-up / api-status — mesh read API (mesh-api.py, default port 5409)
+# --------------------------------------------------------------------------
+
+cmd_api_up() {
+    local port="${1:-5409}"
+    case "${port}" in ''|*[!0-9]*) die_usage "usage: $0 api-up [port]" ;; esac
+    local unit="mesh-api@${port}.service"
+    if systemctl --user enable --now "${unit}" 2>&1; then
+        log_info "mesh API up (user unit ${unit})"
+    else
+        log_warn "user unit failed; foreground instead (Ctrl-C stops)"
+        exec /usr/bin/python3 "${SELF_DIR}/mesh-api.py" --port "${port}"
+    fi
+}
+
+cmd_api_status() {
+    local port="${1:-5409}"
+    case "${port}" in ''|*[!0-9]*) die_usage "usage: $0 api-status [port]" ;; esac
+    local code
+    code="$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/api/rev" 2>&1)" || code="000"
+    if [[ "${code}" = "200" ]]; then
+        log_info "mesh API alive on :${port}"
+    else
+        log_warn "mesh API not answering on :${port} (curl=${code})"
+        exit 2
+    fi
+}
+
+# --------------------------------------------------------------------------
 # nodes — list the onboard registry (name, mesh IP, machine-id, date)
 # --------------------------------------------------------------------------
 
@@ -868,6 +897,12 @@ cmd_install_helpers() {
     [[ -x "${me}" ]] || die_fail "self not executable: ${me}"
     ln -sf "${me}" /usr/local/bin/mesh || die_fail "symlink failed"
     log_info "mesh -> ${me}"
+
+    log_step " symlink /usr/local/bin/mesh-api"
+    local api="${SELF_DIR}/mesh-api.py"
+    [[ -x "${api}" ]] || die_fail "mesh-api.py not found or not executable"
+    ln -sf "${api}" /usr/local/bin/mesh-api || die_fail "api symlink failed"
+    log_info "mesh-api -> ${api}"
 
     log_step " validator /usr/local/bin/mesh-remote-shred"
     cat > /usr/local/bin/mesh-remote-shred << 'HELPEOF'
@@ -1117,6 +1152,8 @@ Commands:
   onboard <name> [ip] [groups] [mid]
                                     Lighthouse: sign cert, build one-file bundle
   nodes                             Lighthouse: list onboarded nodes
+  api-up [port]                     Both: start mesh read API (default 5409)
+  api-status [port]                 Both: check mesh read API
   inventory <args>                  Both: inventory DB (init/import/sync/findings)
   join <bundle-file>                Client: install from local bundle
   join-b64 <base64-string>          Client: install from inline base64
@@ -1148,6 +1185,8 @@ case "$1" in
     join-b64-file) shift; cmd_join_b64_file "$@" ;;
     join-from)     shift; cmd_join_from "$@" ;;
     nodes)         shift; cmd_nodes "$@" ;;
+    api-up)        shift; cmd_api_up "$@" ;;
+    api-status)    shift; cmd_api_status "$@" ;;
     inventory)     shift; cmd_inventory "$@" ;;
     shred)         shift; cmd_shred "$@" ;;
     shred-remote)  shift; cmd_shred_remote "$@" ;;
