@@ -16,6 +16,8 @@
 # ==============================================================================
 set -uo pipefail
 
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 HOTSPOT="Samsung Galaxy A6 1394"
 HOME_SSID="belkin2"
 REMOTE="owner@10.100.0.1"
