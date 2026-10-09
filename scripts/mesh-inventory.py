@@ -23,7 +23,7 @@ import sqlite3
 import sys
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS eero_forwards(
 CREATE TABLE IF NOT EXISTS findings(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT,
   detail TEXT, status TEXT DEFAULT 'open');
+CREATE TABLE IF NOT EXISTS latency(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, network TEXT,
+  target TEXT, sent INTEGER, recv INTEGER, min_ms REAL, avg_ms REAL,
+  max_ms REAL);
+CREATE TABLE IF NOT EXISTS rustdesk_server(
+  id INTEGER PRIMARY KEY CHECK (id=1), host TEXT, key_pub TEXT,
+  installed_at TEXT);
+CREATE TABLE IF NOT EXISTS rustdesk_nodes(
+  name TEXT PRIMARY KEY, rustdesk_id TEXT, mesh_ip TEXT, configured_at TEXT);
 """
 
 DEFAULT_DB = "/var/lib/mesh/inventory.db"
@@ -208,6 +217,46 @@ def cmd_findings(args):
     print("OPEN=%d" % len(rows))
 
 
+def cmd_latency_record(args):
+    # Pure DB write (no subprocess: repo lint forbids it in .py).
+    # Measurement happens in mesh-latency.sh, which calls this.
+    db = connect(args.db)
+    migrate(db)
+    try:
+        sent, recv = int(args.sent), int(args.recv)
+    except Exception:
+        print("FAIL: sent/recv must be integers")
+        sys.exit(2)
+
+    def num(v):
+        try:
+            return float(v)
+        except Exception:
+            return None
+
+    db.execute("INSERT INTO latency(ts,network,target,sent,recv,"
+               "min_ms,avg_ms,max_ms) VALUES(?,?,?,?,?,?,?,?)",
+               (now(), args.network, args.target, sent, recv,
+                num(args.min), num(args.avg), num(args.max)))
+    db.commit()
+    print("LATENCY network=%s target=%s %d/%d avg=%s" %
+          (args.network, args.target, recv, sent, args.avg))
+
+
+def cmd_history(args):
+    db = connect(args.db)
+    migrate(db)
+    rows = db.execute(
+        "SELECT ts,network,target,sent,recv,avg_ms FROM latency"
+        " ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
+    for ts, net, tgt, sent, recv, av in rows:
+        avail = "%.0f%%" % (100.0 * recv / sent) if sent else "n/a"
+        print("%s|%s|%s|%s|%s" % (
+            ts, net, tgt, avail,
+            ("%.1fms" % av) if av is not None else "n/a"))
+    print("ROWS=%d" % len(rows))
+
+
 def cmd_sync(args):
     db = connect(args.db)
     migrate(db)
@@ -257,7 +306,8 @@ def cmd_sync(args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="mesh-inventory.py")
-    ap.add_argument("--db", default=DEFAULT_DB)
+    ap.add_argument("--db",
+                    default=os.environ.get("MESH_INVENTORY_DB", DEFAULT_DB))
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init")
     sub.add_parser("import-local")
@@ -270,6 +320,18 @@ def main(argv=None):
     faa.add_argument("detail")
     sub.add_parser("findings")
     sub.add_parser("sync")
+    lat = sub.add_parser("latency")
+    lats = lat.add_subparsers(dest="sub", required=True)
+    latr = lats.add_parser("record")
+    latr.add_argument("network")
+    latr.add_argument("target")
+    latr.add_argument("sent")
+    latr.add_argument("recv")
+    latr.add_argument("min", nargs="?", default="")
+    latr.add_argument("avg", nargs="?", default="")
+    latr.add_argument("max", nargs="?", default="")
+    lath = lats.add_parser("history")
+    lath.add_argument("--limit", type=int, default=30)
     args = ap.parse_args(argv)
     try:
         if args.cmd == "init":
@@ -285,6 +347,11 @@ def main(argv=None):
             cmd_findings(args)
         elif args.cmd == "sync":
             sys.exit(cmd_sync(args))
+        elif args.cmd == "latency":
+            if args.sub == "record":
+                cmd_latency_record(args)
+            elif args.sub == "history":
+                cmd_history(args)
     except SystemExit:
         raise
     except Exception as e:

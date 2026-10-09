@@ -41,8 +41,8 @@ pick_iface() {
 }
 
 wait_for_route() {
-    local tries
-    for tries in $(seq 1 15); do
+    local _
+    for _ in $(seq 1 15); do
         if ip route show 2>&1 | grep -q "^default"; then
             return 0
         fi
@@ -53,6 +53,14 @@ wait_for_route() {
 
 # matrix <label> — one row per check, sets MATRIX_RED on any failure.
 MATRIX_RED=0
+record_latency() {
+    # Best-effort history for the portal chart; never fails the matrix.
+    local net="$1"
+    if [[ -x "${SELF_DIR}/mesh-latency.sh" ]]; then
+        "${SELF_DIR}/mesh-latency.sh" "${net}" "10.100.0.1" 5 2>&1 | head -n 1 || true
+    fi
+    return 0
+}
 matrix() {
     local label="$1" gw ok
     printf '\n### %s (ssid=%s) ###\n' "${label}" "$(current_ssid)"
@@ -88,6 +96,7 @@ matrix() {
         printf 'nebula       : NOT ACTIVE\n'
         MATRIX_RED=1
     fi
+    record_latency "$(current_ssid)"
 }
 
 ssid_visible() {

@@ -84,8 +84,26 @@ def _mesh(db_path):
                     "SELECT COUNT(*) FROM %s" % tbl).fetchone()[0]
             except Exception:
                 counts[key] = 0
+        latency = []
+        availability = {}
+        try:
+            latency = [dict(r) for r in db.execute(
+                "SELECT ts,network,target,sent,recv,avg_ms FROM latency"
+                " ORDER BY id DESC LIMIT 60")]
+            for r in db.execute(
+                    "SELECT network, SUM(sent), SUM(recv), AVG(avg_ms),"
+                    " COUNT(*) FROM latency GROUP BY network"):
+                net, sent, recv, avg, n = (r[0], r[1] or 0, r[2] or 0,
+                                           r[3], r[4])
+                availability[net] = {
+                    "checks": n,
+                    "up_pct": round(100.0 * recv / sent, 1) if sent else None,
+                    "avg_ms": round(avg, 1) if avg is not None else None}
+        except Exception:
+            pass
         return 200, {"available": True, "nodes": nodes, "peers": peers,
-                     "findings": findings, "counts": counts}
+                     "findings": findings, "counts": counts,
+                     "latency": latency, "availability": availability}
     except Exception:
         return 503, {"available": False, "nodes": [], "peers": [],
                      "findings": [], "counts": {}}
