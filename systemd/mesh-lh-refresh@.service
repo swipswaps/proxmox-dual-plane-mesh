@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh nebula public lighthouse path from DuckDNS (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/mesh-lh-refresh.sh %i 4242
