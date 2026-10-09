@@ -717,6 +717,8 @@ inventory_refresh() {
 # --------------------------------------------------------------------------
 
 cmd_api_up() {
+    # Binds 0.0.0.0 deliberately: other mesh nodes must reach it, and every
+    # route is read-only. Never add a write route without re-examining this.
     local port="${1:-5409}"
     case "${port}" in ''|*[!0-9]*) die_usage "usage: $0 api-up [port]" ;; esac
     local unit="mesh-api@${port}.service"
@@ -724,7 +726,7 @@ cmd_api_up() {
         log_info "mesh API up (user unit ${unit})"
     else
         log_warn "user unit failed; foreground instead (Ctrl-C stops)"
-        exec /usr/bin/python3 "${SELF_DIR}/mesh-api.py" --port "${port}"
+        exec /usr/bin/python3 "${SELF_DIR}/mesh-api.py" --bind 0.0.0.0 --port "${port}"
     fi
 }
 
