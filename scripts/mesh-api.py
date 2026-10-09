@@ -63,6 +63,7 @@ def _rev(repo_root):
 def _mesh(db_path):
     try:
         db = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+        db.row_factory = sqlite3.Row
     except Exception:
         return 503, {"available": False}
     try:
@@ -149,7 +150,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Access-Control-Request-Private-Network")
+        # Private Network Access: public Pages fetching loopback/LAN/mesh
+        # IPs is blocked without this explicit opt-in.
+        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
