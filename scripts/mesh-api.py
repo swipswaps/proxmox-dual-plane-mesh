@@ -27,7 +27,7 @@ import os
 import sqlite3
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 RATE = {}
@@ -245,7 +245,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     cfg = {"inventory": args.db, "clientdb": args.clientdb,
            "cert": args.cert, "repo_root": args.repo_root}
-    srv = HTTPServer((args.bind, args.port), make_handler(cfg))
+    # Threaded: portal tabs probe concurrently; a single-threaded server
+    # head-of-line blocks bursts into timeouts (observed in eval runs).
+    srv = ThreadingHTTPServer((args.bind, args.port), make_handler(cfg))
     if args.tls_cert:
         import ssl
 
