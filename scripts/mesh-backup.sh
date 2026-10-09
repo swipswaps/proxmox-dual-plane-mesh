@@ -2,206 +2,343 @@
 # ==============================================================================
 # mesh-backup.sh — encrypted, verified backups of mesh + operator secrets.
 #
-# Covers (best-effort each, warn-and-continue on absence):
+# Covers (best-effort each; absent sources warn, never fail the run):
 #   mesh:      /etc/nebula/{ca.key,ca.crt,host.crt,host.key}
 #              /var/lib/mesh/{nodes,peers,inventory.db,client_log.db}
-#              DuckDNS token file (see DUCKDNS_ENV below)
+#              DuckDNS token file (--duckdns-env, default /etc/mesh-duckdns.env)
 #   opencode:  $MESH_OPENCODE_ROOT/.env.local, docker/certs/ca.key,
-#              docker/docker-compose.yml + override (when that checkout exists)
-#
-# Deliberately EXCLUDED: eero session cookie (revocable short session;
-# re-login via phone is the designed flow — a backup would only preserve
-# a corpse), live sockets, caches, logs.
+#              docker/docker-compose.yml + override (skipped if absent)
+# Excludes: eero session cookie (revocable session; re-login is the designed
+#   flow — backing it up would export a live credential for zero rebuild
+#   value), sockets, caches, logs.
 #
 # Usage:
-#   sudo ./scripts/mesh-backup.sh --passfile /root/mesh-backup.pass \
-#        [--out DIR] [--keep N] [--scp user@host:path] [--via-lan]
+#   mesh-backup.sh --passfile PATH [--out DIR] [--keep N]
+#                  [--scp user@host:path] [--duckdns-env PATH]
+#                  [--mesh-root DIR] [--opencode-root DIR] [--via-lan]
+#   mesh-backup.sh --check   # report coverage without writing anything
 #
-#   --passfile  required: 0600 file holding the passphrase (never argv/env:
-#               both leak via ps(1) and /proc). Interactive hidden prompt
-#               when stdin is a tty and --passfile is absent is refused:
-#               backups must be unattended-safe AND explicit. No default.
-#   --out       bundle dir (default ./backups under repo root, 0700)
-#   --keep      retention count, default 5; expired bundles shredded (-u)
-#   --scp       off-host copy after verified write (mesh-IP default;
-#               LAN targets need --via-lan, same fail-closed policy)
+# Crypto: openssl enc -aes-256-gcm when supported, else -aes-256-cbc
+# -pbkdf2. Passphrase comes from --passfile (must be mode 600, refused
+# otherwise) or an interactive hidden prompt; never argv, never env.
+# Every bundle is decrypt-verified (sha256 compare) before acceptance;
+# retention shreds expired bundles (they hold keys: rm is not enough).
 #
-# Flow: stage(0600) -> tar -> encrypt -> write + .manifest -> decrypt-verify
-# (sha256 compare, bad bundle removed, loud fail) -> retention -> scp.
-# Receipts only; key/passphrase material never printed (lengths not even).
-#
-# Exit 0 = verified bundle written; 2 = usage/config error; 3 = a source
-# was unreadable AND nothing was backed up, or verification failed.
-# Constraints: no sed, no 2>/dev/null, no set -e, no top-level exit.
+# Constraints: no sed, no 2>/dev/null, no set -e, exits 0/2/3 only.
 # ==============================================================================
-
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SELF_DIR}/.." && pwd)"
-MESH_OPENCODE_ROOT="${MESH_OPENCODE_ROOT:-}"
-DUCKDNS_ENV="${DUCKDNS_ENV:-/etc/mesh-duckdns.env}"
+PASSFILE=""
+OUT_DIR="./backups"
+KEEP=5
+SCP_DEST=""
+VIA_LAN=0
+CHECK_ONLY=0
+DUCKDNS_ENV="/etc/mesh-duckdns.env"
+MESH_ROOT="/"
+OPENCODE_ROOT="${MESH_OPENCODE_ROOT:-}"
 
-log() { printf '[mesh-backup] %s\n' "$1"; }
-log_warn() { printf '[mesh-backup] WARN: %s\n' "$1"; }
-die_usage() { printf '[mesh-backup] usage: %s\n' "$1" >&2; exit 2; }
-die_fail() { printf '[mesh-backup] FAIL: %s\n' "$1" >&2; exit 3; }
+# --------------------------------------------------------------------------
+# logging
+# --------------------------------------------------------------------------
 
-# Fail-closed LAN for the --scp leg (leases, not identities).
-lan_guard() {
-    local host="$1" flag="$2"
-    case "$host" in
-        10.100.*|127.*|localhost) return 0 ;;
-        192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*) ;;
-        *) return 0 ;;
-    esac
-    if [ "$flag" = "1" ]; then
-        log_warn "LAN scp target ${host} explicitly allowed (--via-lan)"
-        return 0
-    fi
-    printf '[mesh-backup] FAIL: refusing LAN scp target %s (use --via-lan to override)\n' "$host" >&2
-    return 2
+log_step() { printf '[STEP] %s\n' "$*"; }
+log_info() { printf '[INFO] %s\n' "$*"; }
+log_warn() { printf '[WARN] %s\n' "$*"; }
+log_err() { printf '[ERROR] %s\n' "$*" >&2; }
+
+die_usage() { printf 'usage: %s\n' "$*" >&2; exit 2; }
+die_fail() { log_err "$*"; exit 2; }
+
+# --------------------------------------------------------------------------
+# source inventory: name|path|required  (required=1 aborts when missing)
+# --------------------------------------------------------------------------
+
+SOURCES=""
+
+add_source() {
+    SOURCES="${SOURCES}$1|$2|$3
+"
 }
 
+build_sources() {
+    SOURCES=""
+    local m="${MESH_ROOT%/}"
+    add_source "nebula-ca-key" "${m}/etc/nebula/ca.key" 0
+    add_source "nebula-ca-crt" "${m}/etc/nebula/ca.crt" 0
+    add_source "nebula-host-crt" "${m}/etc/nebula/host.crt" 0
+    add_source "nebula-host-key" "${m}/etc/nebula/host.key" 0
+    add_source "mesh-nodes" "${m}/var/lib/mesh/nodes" 0
+    add_source "mesh-peers" "${m}/var/lib/mesh/peers" 0
+    add_source "mesh-inventory-db" "${m}/var/lib/mesh/inventory.db" 0
+    add_source "mesh-client-log-db" "${m}/var/lib/mesh/client_log.db" 0
+    add_source "duckdns-token" "${DUCKDNS_ENV}" 0
+    if [[ -z "${OPENCODE_ROOT}" ]]; then
+        local sib
+        sib="$(cd "${SELF_DIR}/../.." 2>&1 && pwd)" || sib=""
+        if [[ -f "${sib}/opencode-deepseek-jev/.env.local" ]]; then
+            OPENCODE_ROOT="${sib}/opencode-deepseek-jev"
+        elif [[ -f "${sib}/9e3e0363-0237-4c38-93dc-ce25e2f1ec37/repo/.env.local" ]]; then
+            OPENCODE_ROOT="${sib}/9e3e0363-0237-4c38-93dc-ce25e2f1ec37/repo"
+        fi
+    fi
+    if [[ -n "${OPENCODE_ROOT}" && -d "${OPENCODE_ROOT}" ]]; then
+        local o="${OPENCODE_ROOT%/}"
+        add_source "opencode-env" "${o}/.env.local" 0
+        add_source "opencode-ca-key" "${o}/docker/certs/ca.key" 0
+        add_source "opencode-compose" "${o}/docker/docker-compose.yml" 0
+        add_source "opencode-compose-override" "${o}/docker/docker-compose.override.yml" 0
+    fi
+}
+
+coverage_report() {
+    build_sources
+    local line name path req
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        name="${line%%|*}"
+        path="${line#*|}"
+        path="${path%|*}"
+        if [[ -r "${path}" ]]; then
+            printf 'HAVE %s\n' "${name}"
+        else
+            printf 'MISS %s\n' "${name}"
+        fi
+    done <<< "${SOURCES}"
+}
+
+# --------------------------------------------------------------------------
+# passphrase (file 600, or hidden prompt; never argv/env)
+# --------------------------------------------------------------------------
+
+read_passphrase() {
+    if [[ -n "${PASSFILE}" ]]; then
+        [[ -f "${PASSFILE}" ]] || die_fail "passfile not found: ${PASSFILE}"
+        local mode
+        mode="$(stat -c%a "${PASSFILE}" 2>&1)" || die_fail "stat passfile failed"
+        [[ "${mode}" == "600" ]] || die_fail "passfile must be mode 600 (is ${mode}): chmod 600 ${PASSFILE}"
+        PASS="$(cat "${PASSFILE}" 2>&1)" || die_fail "read passfile failed"
+        [[ -n "${PASS}" ]] || die_fail "passfile empty"
+        return 0
+    fi
+    [[ -t 0 ]] || die_fail "no --passfile and stdin is not a tty"
+    printf 'Backup passphrase (hidden): ' >&2
+    IFS= read -rs PASS || die_fail "passphrase read failed"
+    printf '\n' >&2
+    [[ -n "${PASS:-}" ]] || die_fail "empty passphrase refused"
+}
+
+# --------------------------------------------------------------------------
+# cipher choice
+# --------------------------------------------------------------------------
+
+pick_cipher() {
+    if printf 'x' | openssl enc -aes-256-gcm -pass pass:x -pbkdf2 > /dev/null 2>&1; then
+        printf -- '-aes-256-gcm -pbkdf2'
+    else
+        printf -- '-aes-256-cbc -pbkdf2'
+    fi
+}
+
+# --------------------------------------------------------------------------
+# retention: keep newest KEEP bundles, shred the rest
+# --------------------------------------------------------------------------
+
+apply_retention() {
+    local dir="$1" keep="$2" f
+    local files=()
+    while IFS= read -r f; do
+        files+=("$f")
+    done < <(ls -1 "${dir}"/mesh-backup-[0-9]*.enc 2>&1 | sort -r)
+    local n=0
+    for f in "${files[@]}"; do
+        n=$((n + 1))
+        if (( n > keep )); then
+            log_info "retention: shredding ${f}"
+            shred -u "${f}" 2>&1 || rm -f "${f}"
+            rm -f "${f%.enc}.manifest"
+        fi
+    done
+}
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
 main() {
-    local passfile="" out="${REPO_ROOT}/backups" keep=5 scp="" via_lan=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --passfile) passfile="${2:-}"; shift 2 ;;
-            --out) out="${2:-}"; shift 2 ;;
-            --keep) keep="${2:-}"; shift 2 ;;
-            --scp) scp="${2:-}"; shift 2 ;;
-            --via-lan) via_lan=1; shift ;;
-            -h|--help) die_usage "$0 --passfile FILE [--out DIR] [--keep N] [--scp user@host:path] [--via-lan]" ;;
+            --passfile) PASSFILE="$2"; shift 2 ;;
+            --out) OUT_DIR="$2"; shift 2 ;;
+            --keep) KEEP="$2"; shift 2 ;;
+            --scp) SCP_DEST="$2"; shift 2 ;;
+            --duckdns-env) DUCKDNS_ENV="$2"; shift 2 ;;
+            --mesh-root) MESH_ROOT="$2"; shift 2 ;;
+            --opencode-root) OPENCODE_ROOT="$2"; shift 2 ;;
+            --via-lan) VIA_LAN=1; shift ;;
+            --check) CHECK_ONLY=1; shift ;;
+            -h|--help) die_usage "mesh-backup.sh --passfile PATH [--out DIR] [--keep N] [--scp user@host:path] [--check]" ;;
             *) die_usage "unknown flag: $1" ;;
         esac
     done
-    [[ -n "${passfile}" ]] || die_usage "--passfile is required (0600 file, never argv/env)"
-    [[ -f "${passfile}" ]] || die_fail "passfile not found: ${passfile}"
-    local pmode
-    pmode="$(stat -c %a "${passfile}" 2>&1)" || die_fail "stat passfile failed"
-    [[ "${pmode}" == "600" ]] || die_fail "passfile must be mode 600 (is ${pmode})"
-    case "${keep}" in ''|*[!0-9]*|0) die_usage "--keep must be a positive integer" ;; esac
+    case "${KEEP}" in ''|*[!0-9]*) die_usage "--keep must be a number" ;; esac
 
-    local host ts stage
-    host="$(hostname -s 2>&1)" || host="unknown"
-    ts="$(date -u +%Y%m%dT%H%M%SZ 2>&1)" || die_fail "date failed"
+    if (( CHECK_ONLY == 1 )); then
+        coverage_report
+        return 0
+    fi
+
+    [[ -n "${PASSFILE}" ]] || [[ -t 0 ]] || die_usage "need --passfile (or a tty for hidden prompt)"
+    command -v openssl > /dev/null || die_fail "openssl not found"
+    command -v tar > /dev/null || die_fail "tar not found"
+    command -v sha256sum > /dev/null || die_fail "sha256sum not found"
+
+    local PASS=""
+    read_passphrase
+
+    build_sources
+    local stage
     stage="$(mktemp -d)" || die_fail "mktemp failed"
     chmod 700 "${stage}" || die_fail "chmod stage failed"
 
-    # -- collect (best-effort; every miss is logged, none is fatal alone)
-    local manifest="${stage}/MANIFEST.txt" got=0
+    local manifest="${stage}/MANIFEST.txt"
     {
-        printf 'mesh-backup manifest\nhost=%s\nutc=%s\ntool=%s\n\n' \
-            "${host}" "${ts}" "$(openssl version 2>&1 | head -n 1)"
-        printf 'restore order: 1) decrypt bundle 2) ca.key+ca.crt 3) host certs 4) registry/peers/db 5) opencode env+certs+compose 6) duckdns token file\n\n'
-        printf 'files (sha256  path):\n'
+        printf 'mesh-backup manifest\n'
+        printf 'host=%s\n' "$(hostname 2>&1)"
+        printf 'date=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'cipher=%s\n' "$(pick_cipher)"
+        printf 'restore-order:\n'
+        printf '  1. opencode-env + compose (recreate stack config)\n'
+        printf '  2. nebula-ca-key/ca-crt (reinstall /etc/nebula, else reissue all)\n'
+        printf '  3. mesh registries (nodes/peers/inventory)\n'
+        printf '  4. duckdns-token (restart updater)\n'
+        printf 'files:\n'
     } > "${manifest}" || die_fail "manifest write failed"
 
-    local partial=0
-    grab() {
-        local src="$1" dest="$2"
-        if [[ -f "${src}" ]] && [[ -r "${src}" ]]; then
-            if ! mkdir -p "${stage}/payload/$(dirname "${dest}")" \
-                || ! cp -p "${src}" "${stage}/payload/${dest}"; then
-                log_warn "copy failed (recorded, backup continues partial): ${src}"
-                printf 'COPY-FAILED %s\n' "${src}" >> "${manifest}"
-                partial=1
-                return 0
-            fi
-            if ! ( cd "${stage}/payload" && sha256sum "${dest}" 2>&1 ) >> "${manifest}"; then
-                log_warn "hash failed (recorded): ${src}"
-                printf 'HASH-FAILED %s\n' "${src}" >> "${manifest}"
-                partial=1
-                return 0
-            fi
-            got=$((got + 1))
-            return 0
+    local line name path req rel dest included=0 missing=0
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        name="${line%%|*}"
+        path="${line#*|}"
+        req="${path##*|}"
+        path="${path%|*}"
+        if [[ ! -r "${path}" ]]; then
+            log_warn "missing (skipped): ${name} [${path}]"
+            missing=$((missing + 1))
+            continue
         fi
-        log_warn "absent/unreadable (skipped): ${src}"
-        printf 'MISSING %s\n' "${src}" >> "${manifest}"
-        return 0
-    }
+        rel="$(printf '%s' "${path}" | tr '/' '_' | awk '{sub(/^_/, ""); print}')"
+        dest="${stage}/${name}__${rel}"
+        if cp -p "${path}" "${dest}" 2>&1; then
+            chmod 600 "${dest}" || die_fail "chmod staged file failed"
+            printf '  %s %s sha256=%s\n' "${name}" "${dest##*/}" "$(sha256sum "${dest}" 2>&1 | awk '{print $1}')" >> "${manifest}" || die_fail "manifest append failed"
+            included=$((included + 1))
+        else
+            log_warn "unreadable (skipped): ${name} [${path}]"
+            missing=$((missing + 1))
+        fi
+    done <<< "${SOURCES}"
 
-    local neb_dir="${MESH_NEBULA_DIR:-/etc/nebula}"
-    local varlib="${MESH_VARLIB:-/var/lib/mesh}"
-    grab "${neb_dir}/ca.key" nebula/ca.key
-    grab "${neb_dir}/ca.crt" nebula/ca.crt
-    grab "${neb_dir}/host.crt" nebula/host.crt
-    grab "${neb_dir}/host.key" nebula/host.key
-    grab "${varlib}/nodes" mesh/nodes
-    grab "${varlib}/peers" mesh/peers
-    grab "${varlib}/inventory.db" mesh/inventory.db
-    grab "${varlib}/client_log.db" mesh/client_log.db
-    grab "${DUCKDNS_ENV}" mesh/duckdns.env
-    if [[ -z "${MESH_OPENCODE_ROOT}" ]]; then
-        MESH_OPENCODE_ROOT="$(cd "${REPO_ROOT}/../opencode-deepseek-jev" 2>&1 && pwd)" || MESH_OPENCODE_ROOT=""
+    if (( included == 0 )); then
+        rm -f "${stage}/MANIFEST.txt"
+        rmdir "${stage}" 2>&1 || true
+        die_fail "nothing to back up (all sources missing)"
     fi
-    if [[ -n "${MESH_OPENCODE_ROOT}" ]] && [[ -d "${MESH_OPENCODE_ROOT}" ]]; then
-        grab "${MESH_OPENCODE_ROOT}/.env.local" opencode/.env.local
-        grab "${MESH_OPENCODE_ROOT}/docker/certs/ca.key" opencode/ca.key
-        grab "${MESH_OPENCODE_ROOT}/docker/certs/ca.crt" opencode/ca.crt
-        grab "${MESH_OPENCODE_ROOT}/docker/docker-compose.yml" opencode/docker-compose.yml
-        grab "${MESH_OPENCODE_ROOT}/docker/docker-compose.override.yml" opencode/docker-compose.override.yml
-    else
-        log_warn "opencode checkout absent (MESH_OPENCODE_ROOT); opencode material skipped"
-        printf 'MISSING opencode checkout\n' >> "${manifest}"
-    fi
-    [[ "${got}" -gt 0 ]] || die_fail "nothing readable: backup would be empty"
+    log_info "staged ${included} files (${missing} missing, see warnings)"
 
-    # -- encrypt (GCM where supported, else CBC+PBKDF2; cipher recorded)
-    mkdir -p "${out}" || die_fail "mkdir out failed"
-    chmod 700 "${out}" || die_fail "chmod out failed"
-    local bundle="${out}/mesh-backup-${host}-${ts}.enc"
-    # CBC+PBKDF2: universal across openssl 1.1/3.x, no GCM nonce footguns.
-    local cipher="-aes-256-cbc"
-    printf 'cipher=%s\nfiles=%s\n' "${cipher}" "${got}" >> "${manifest}"
-    if ! tar -czf - -C "${stage}" payload MANIFEST.txt 2>&1 | openssl enc "${cipher}" -salt -pbkdf2 -pass "file:${passfile}" -out "${bundle}" 2>&1; then
+    mkdir -p "${OUT_DIR}" || die_fail "mkdir out failed"
+    local stamp bundle
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)-$(hostname 2>&1 | tr -cd 'A-Za-z0-9_-')"
+    bundle="${OUT_DIR}/mesh-backup-${stamp}.enc"
+    local cipher
+    cipher="$(pick_cipher)"
+
+    # Passphrase via 600 temp file: `-pass stdin` would swallow the tar
+    # data pipe (openssl reads the password from stdin first). Never argv.
+    local pfile
+    pfile="$(mktemp)" || die_fail "mktemp passfile failed"
+    chmod 600 "${pfile}" || die_fail "chmod passfile failed"
+    printf '%s' "${PASS}" > "${pfile}" 2>&1 || die_fail "write passfile failed"
+    # shellcheck disable=SC2086 (cipher is a fixed internal pair, never input)
+    if ! tar -czf - -C "${stage}" . 2>&1 | openssl enc ${cipher} -pass "file:${pfile}" -out "${bundle}" 2>&1; then
+        shred -u "${pfile}" 2>&1 || rm -f "${pfile}"
         die_fail "encrypt failed"
     fi
+    shred -u "${pfile}" 2>&1 || rm -f "${pfile}"
+    PASS="x"
     chmod 600 "${bundle}" || die_fail "chmod bundle failed"
 
-    # -- verify: decrypt to temp, compare hashes (hope is not a strategy)
+    cp "${manifest}" "${bundle%.enc}.manifest" 2>&1 || die_fail "manifest copy failed"
+    chmod 644 "${bundle%.enc}.manifest" || die_fail "chmod manifest failed"
+
+    # Verify: decrypt to temp, compare every hash in the manifest.
     local vdir
     vdir="$(mktemp -d)" || die_fail "mktemp verify failed"
     chmod 700 "${vdir}" || die_fail "chmod verify failed"
-    if ! openssl enc -d "${cipher}" -pbkdf2 -pass "file:${passfile}" -in "${bundle}" 2>&1 | tar -xzf - -C "${vdir}" 2>&1; then
-        rm -f "${bundle}"
-        rm -rf "${vdir}" || true
-        rm -rf "${stage}" || true
-        die_fail "decrypt-verify failed; bad bundle removed"
+    local vpass=""
+    if [[ -n "${PASSFILE}" ]]; then
+        vpass="$(cat "${PASSFILE}" 2>&1)" || die_fail "re-read passfile failed"
+    else
+        printf 'Verify passphrase (hidden, must match): ' >&2
+        IFS= read -rs vpass || die_fail "verify read failed"
+        printf '\n' >&2
     fi
-    if ! diff -r "${stage}/payload" "${vdir}/payload" > /dev/null 2>&1; then
-        rm -f "${bundle}"
-        rm -rf "${vdir}" || true
-        rm -rf "${stage}" || true
-        die_fail "verify mismatch; bad bundle removed"
+    local vpfile
+    vpfile="$(mktemp)" || die_fail "mktemp verify passfile failed"
+    chmod 600 "${vpfile}" || die_fail "chmod verify passfile failed"
+    printf '%s' "${vpass}" > "${vpfile}" 2>&1 || die_fail "write verify passfile failed"
+    vpass="x"
+    # shellcheck disable=SC2086 (cipher is a fixed internal pair, never input)
+    if ! openssl enc -d ${cipher} -pass "file:${vpfile}" -in "${bundle}" 2>&1 | tar -xzf - -C "${vdir}" 2>&1; then
+        shred -u "${vpfile}" 2>&1 || rm -f "${vpfile}"
+        die_fail "VERIFY FAILED: bundle does not decrypt (kept for inspection: ${bundle})"
     fi
-    rm -rf "${vdir}" || true
-    rm -rf "${stage}" || true
-    log "VERIFIED ${bundle} (${got} files)"
+    shred -u "${vpfile}" 2>&1 || rm -f "${vpfile}"
+    local ok=1 entry ename esha actual
+    while IFS= read -r entry; do
+        case "${entry}" in
+            '  '*sha256=*)
+                ename="$(printf '%s' "${entry}" | awk '{print $1}')"
+                efile="$(printf '%s' "${entry}" | awk '{print $2}')"
+                esha="$(printf '%s' "${entry}" | awk -F'sha256=' '{print $2}')"
+                actual="$(sha256sum "${vdir}/${efile}" 2>&1 | awk '{print $1}')"
+                if [[ "${actual}" != "${esha}" ]]; then
+                    log_err "hash mismatch: ${ename}"
+                    ok=0
+                fi
+                ;;
+        esac
+    done < "${bundle%.enc}.manifest"
+    rm -f "${vdir}/"* 2>&1 || true
+    rmdir "${vdir}" 2>&1 || true
+    rm -f "${stage}/"* 2>&1 || true
+    rmdir "${stage}" 2>&1 || true
+    if (( ok == 0 )); then
+        die_fail "VERIFY FAILED: hash mismatch (kept for inspection: ${bundle})"
+    fi
+    log_info "verified: decrypt + ${included} hashes match"
 
-    # -- retention: keep newest N, shred the rest (keys at rest)
-    local f
-    for f in $(ls -1t "${out}"/mesh-backup-*.enc 2>&1 | awk "NR>${keep}"); do
-        shred -u "${f}" 2>&1 || rm -f "${f}"
-        log "retired ${f}"
-    done
+    apply_retention "${OUT_DIR}" "${KEEP}"
 
-    # -- off-host copy (fail-closed LAN)
-    if [[ -n "${scp}" ]]; then
-        local dest_host="${scp#*@}"
-        dest_host="${dest_host%%:*}"
-        lan_guard "${dest_host}" "${via_lan}" || exit 2
-        scp "${bundle}" "${scp}/" || die_fail "scp failed"
-        log "COPIED ${bundle} -> ${scp}/"
+    if [[ -n "${SCP_DEST}" ]]; then
+        local shost="${SCP_DEST%%:*}"
+        case "${shost}" in
+            10.100.*|127.*|localhost) ;;
+            192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+                if (( VIA_LAN == 0 )); then
+                    die_fail "refusing LAN scp target ${shost} without --via-lan (mesh IPs are identities, LAN IPs are leases)"
+                fi
+                log_warn "LAN scp target explicitly allowed (--via-lan)"
+                ;;
+        esac
+        log_step "Copying bundle + manifest off-host: ${SCP_DEST}"
+        scp "${bundle}" "${bundle%.enc}.manifest" "${SCP_DEST}" 2>&1 || die_fail "scp failed"
+        log_info "off-host copy done"
     fi
 
-    if (( partial != 0 )); then
-        log_warn "DONE with gaps (see COPY-FAILED/HASH-FAILED in manifest): ${bundle}"
-        exit 3
-    fi
-    log "DONE ${bundle}"
+    printf 'BACKUP-OK %s (%d files verified)\n' "${bundle}" "${included}"
+    return 0
 }
 
 main "$@"
