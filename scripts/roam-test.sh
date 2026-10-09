@@ -71,12 +71,15 @@ matrix() {
         fi
         printf 'ping %-14s : %s\n' "${tgt}" "${ok}"
     done
+    # NOTE: curling OUR OWN mesh IP proves the local stack only (kernel
+    # short-circuits it with no mesh involved). Real service-over-mesh is
+    # checked from the FAR node in the remote leg below.
     local code
     code="$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' https://10.100.0.24:5099/api/rev 2>&1)" || code="000"
     if [[ "${code}" = "200" ]]; then
-        printf 'dashboard-mesh : OK\n'
+        printf 'dashboard-local: OK (local stack; see remote leg for mesh proof)\n'
     else
-        printf 'dashboard-mesh : FAIL (curl=%s)\n' "${code}"
+        printf 'dashboard-local: FAIL (curl=%s)\n' "${code}"
         MATRIX_RED=1
     fi
     if systemctl is-active --quiet nebula 2>&1; then
@@ -125,6 +128,7 @@ remote_matrix() {
     timeout 120 ssh -o BatchMode=yes -o ConnectTimeout=10 "${spec}" \
         "ping -c2 -W3 8.8.8.8 > /dev/null 2>&1 && echo 'remote: internet OK' || echo 'remote: internet FAIL';" \
         "ping -c2 -W3 10.100.0.24 > /dev/null 2>&1 && echo 'remote: mesh-to-.24 OK' || echo 'remote: mesh-to-.24 FAIL';" \
+        "curl -sk --max-time 8 -o /dev/null -w 'remote: dashboard-via-mesh %{http_code}\n' https://10.100.0.24:5099/api/rev 2>&1 || echo 'remote: dashboard-via-mesh FAIL';" \
         "systemctl is-active nebula 2>&1 | head -n 1" 2>&1 | head -n 8 || printf 'remote leg failed (SSH/mesh down from here)\n'
 }
 
