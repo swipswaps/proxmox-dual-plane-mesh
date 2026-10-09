@@ -52,13 +52,13 @@ die_usage() { printf 'usage: %s\n' "$*" >&2; exit 2; }
 die_fail() { log_err "$*"; exit 2; }
 
 # --------------------------------------------------------------------------
-# source inventory: name|path|required  (required=1 aborts when missing)
+# source inventory: name|path (all best-effort; absence warns, see manifest)
 # --------------------------------------------------------------------------
 
 SOURCES=""
 
 add_source() {
-    SOURCES="${SOURCES}$1|$2|$3
+    SOURCES="${SOURCES}$1|$2
 "
 }
 
@@ -94,7 +94,7 @@ build_sources() {
 
 coverage_report() {
     build_sources
-    local line name path req
+    local line name path
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
         name="${line%%|*}"
@@ -216,16 +216,16 @@ main() {
         printf 'files:\n'
     } > "${manifest}" || die_fail "manifest write failed"
 
-    local line name path req rel dest included=0 missing=0
+    local line name path rel dest included=0 missing=0 missing_names=""
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
         name="${line%%|*}"
         path="${line#*|}"
-        req="${path##*|}"
         path="${path%|*}"
         if [[ ! -r "${path}" ]]; then
             log_warn "missing (skipped): ${name} [${path}]"
             missing=$((missing + 1))
+            missing_names="${missing_names} ${name}"
             continue
         fi
         rel="$(printf '%s' "${path}" | tr '/' '_' | awk '{sub(/^_/, ""); print}')"
@@ -237,6 +237,7 @@ main() {
         else
             log_warn "unreadable (skipped): ${name} [${path}]"
             missing=$((missing + 1))
+            missing_names="${missing_names} ${name}(unreadable)"
         fi
     done <<< "${SOURCES}"
 
@@ -246,6 +247,8 @@ main() {
         die_fail "nothing to back up (all sources missing)"
     fi
     log_info "staged ${included} files (${missing} missing, see warnings)"
+    printf 'missing-sources:%s\n' "${missing_names:- none}" >> "${manifest}" || die_fail "manifest append failed"
+    printf 'coverage-note: run on the lighthouse for ca.key/registry; clients cover host keys + opencode files\n' >> "${manifest}" || die_fail "manifest append failed"
 
     mkdir -p "${OUT_DIR}" || die_fail "mkdir out failed"
     local stamp bundle
@@ -332,6 +335,15 @@ main() {
                 log_warn "LAN scp target explicitly allowed (--via-lan)"
                 ;;
         esac
+        # scp never creates remote dirs: make it first as the same user.
+        # Prefer a user-writable landing zone (~/mesh-backups/); system
+        # paths like /var/lib/mesh need remote root and fail here loudly.
+        local ruserhost="${SCP_DEST%%:*}" rdir="${SCP_DEST#*:}" rdir_q
+        rdir_q="$(printf '%q' "${rdir}")"
+        log_step "Preparing remote dir on ${ruserhost}"
+        if ! ssh -o "ConnectTimeout=10" "${ruserhost}" "mkdir -p -- ${rdir_q}" 2>&1; then
+            die_fail "remote mkdir failed (need ${ruserhost} writable path? try ~/mesh-backups/)"
+        fi
         log_step "Copying bundle + manifest off-host: ${SCP_DEST}"
         scp "${bundle}" "${bundle%.enc}.manifest" "${SCP_DEST}" 2>&1 || die_fail "scp failed"
         log_info "off-host copy done"
