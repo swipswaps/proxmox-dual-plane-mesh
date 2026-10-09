@@ -906,6 +906,20 @@ cmd_install_helpers() {
     ln -sf "${api}" /usr/local/bin/mesh-api || die_fail "api symlink failed"
     log_info "mesh-api -> ${api}"
 
+    # The hourly refresher (system timer) execs the INSTALLED refresher,
+    # which calls $SELF_DIR/mesh-lighthouse-cutover.sh — i.e. the installed
+    # copy, NOT the repo. Missing cutover = every change-triggered run dies
+    # with "No such file" while NO-CHANGE runs look healthy (proven
+    # 2026-10-09: public path silently never landed). Install the pair.
+    log_step " refresher + cutover pair in /usr/local/bin"
+    local f
+    for f in mesh-lh-refresh.sh mesh-lighthouse-cutover.sh; do
+        [[ -f "${SELF_DIR}/${f}" ]] || die_fail "missing in checkout: ${f}"
+        install -o root -g root -m 755 "${SELF_DIR}/${f}" "/usr/local/bin/${f}" \
+            || die_fail "install ${f} failed"
+    done
+    log_info "refresher pair installed"
+
     log_step " validator /usr/local/bin/mesh-remote-shred"
     cat > /usr/local/bin/mesh-remote-shred << 'HELPEOF'
 #!/usr/bin/env bash
