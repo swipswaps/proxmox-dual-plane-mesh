@@ -906,6 +906,14 @@ cmd_install_helpers() {
     ln -sf "${api}" /usr/local/bin/mesh-api || die_fail "api symlink failed"
     log_info "mesh-api -> ${api}"
 
+    log_step " symlinks /usr/local/bin/mesh-heal + mesh-latency"
+    local h
+    for h in mesh-heal.sh mesh-latency.sh; do
+        [[ -x "${SELF_DIR}/${h}" ]] || die_fail "${h} not found or not executable"
+        ln -sf "${SELF_DIR}/${h}" "/usr/local/bin/${h%.sh}" || die_fail "${h} symlink failed"
+    done
+    log_info "mesh-heal + mesh-latency linked"
+
     # The hourly refresher (system timer) execs the INSTALLED refresher,
     # which calls $SELF_DIR/mesh-lighthouse-cutover.sh — i.e. the installed
     # copy, NOT the repo. Missing cutover = every change-triggered run dies

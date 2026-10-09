@@ -332,3 +332,28 @@ Verify with:
     ./scripts/check_constraints.sh
 
 Exit 0 means compliant; exit 2 means a violation was found and printed.
+
+12. SELF-HEALING MONITOR LOOP
+----------------------------
+Findings live in the inventory DB (mesh-inventory.py); the healer closes
+the loop (mesh-heal.sh): findings -> actions -> verify -> resolve, all
+logged to heal_actions. Destructive ops are absent by design (forwards are
+never auto-deleted). Dry-run first:
+
+    ./scripts/mesh-heal.sh --dry-run
+    ./scripts/mesh-heal.sh --net <NET_ID>   # eero-backed kinds need this
+
+Latency history feeds the portal chart (mesh-latency.sh measures,
+mesh-inventory.py stores, mesh-api.py serves):
+
+    ./scripts/mesh-latency.sh --auto
+
+Timers (user scope; enable after install-helpers):
+
+    systemctl --user enable --now mesh-heal.timer        # hourly close-loop
+    systemctl --user enable --now mesh-latency.timer     # 5-min samples
+
+Read the loop back:
+
+    ./scripts/mesh-inventory.py findings
+    ./scripts/mesh-inventory.py finding actions --limit 20

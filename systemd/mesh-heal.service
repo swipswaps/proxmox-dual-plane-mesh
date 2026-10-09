@@ -1,0 +1,11 @@
+[Unit]
+Description=Mesh closed-loop healer (findings -> actions -> resolve)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# User timers can't write /var/lib/mesh: point them at the operator DB.
+# System-wide installs override with Environment=MESH_INVENTORY_DB=/var/lib/mesh/inventory.db
+Environment=MESH_INVENTORY_DB=%h/.local/share/mesh/inventory.db
+ExecStart=/usr/local/bin/mesh-heal

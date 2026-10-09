@@ -23,7 +23,7 @@ import sqlite3
 import sys
 import time
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS eero_forwards(
 CREATE TABLE IF NOT EXISTS findings(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT,
   detail TEXT, status TEXT DEFAULT 'open');
+CREATE TABLE IF NOT EXISTS heal_actions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, finding_id INTEGER,
+  action TEXT, result TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS latency(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, network TEXT,
   target TEXT, sent INTEGER, recv INTEGER, min_ms REAL, avg_ms REAL,
@@ -217,6 +220,42 @@ def cmd_findings(args):
     print("OPEN=%d" % len(rows))
 
 
+def cmd_finding_resolve(args):
+    db = connect(args.db)
+    migrate(db)
+    try:
+        rid = int(args.id)
+    except Exception:
+        print("FAIL: id must be an integer")
+        sys.exit(2)
+    cur = db.execute("UPDATE findings SET status='resolved' WHERE id=?",
+                     (rid,))
+    db.execute("INSERT INTO heal_actions(ts,finding_id,action,result,note)"
+               " VALUES(?,?,?,?,?)",
+               (now(), rid, "resolve",
+                "resolved" if cur.rowcount else "no-such-id", args.note))
+    db.commit()
+    print("RESOLVED id=%d" % rid if cur.rowcount else "NO-SUCH id=%d" % rid)
+
+
+def cmd_actions(args):
+    db = connect(args.db)
+    migrate(db)
+    rows = db.execute(
+        "SELECT id,ts,finding_id,action,result,note FROM heal_actions"
+        " ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
+    for rid, ts, fid, act, res, note in rows:
+        print("%d|%s|%s|%s|%s|%s" % (rid, ts, fid, act, res, note))
+    print("ACTIONS=%d" % len(rows))
+
+
+def log_action(db, finding_id, action, result, note=""):
+    db.execute("INSERT INTO heal_actions(ts,finding_id,action,result,note)"
+               " VALUES(?,?,?,?,?)",
+               (now(), finding_id, action, result, note))
+    db.commit()
+
+
 def cmd_latency_record(args):
     # Pure DB write (no subprocess: repo lint forbids it in .py).
     # Measurement happens in mesh-latency.sh, which calls this.
@@ -318,6 +357,16 @@ def main(argv=None):
     faa = fas.add_parser("add")
     faa.add_argument("kind")
     faa.add_argument("detail")
+    far = fas.add_parser("resolve")
+    far.add_argument("id")
+    far.add_argument("note", nargs="?", default="")
+    fal = fas.add_parser("log")
+    fal.add_argument("id")
+    fal.add_argument("action")
+    fal.add_argument("result")
+    fal.add_argument("note", nargs="?", default="")
+    faa2 = fas.add_parser("actions")
+    faa2.add_argument("--limit", type=int, default=20)
     sub.add_parser("findings")
     sub.add_parser("sync")
     lat = sub.add_parser("latency")
@@ -343,6 +392,20 @@ def main(argv=None):
         elif args.cmd == "finding":
             if args.sub == "add":
                 cmd_finding_add(args)
+            elif args.sub == "resolve":
+                cmd_finding_resolve(args)
+            elif args.sub == "log":
+                db = connect(args.db)
+                migrate(db)
+                try:
+                    fid = int(args.id)
+                except Exception:
+                    print("FAIL: id must be an integer")
+                    sys.exit(2)
+                log_action(db, fid, args.action, args.result, args.note)
+                print("LOGGED id=%d %s=%s" % (fid, args.action, args.result))
+            elif args.sub == "actions":
+                cmd_actions(args)
         elif args.cmd == "findings":
             cmd_findings(args)
         elif args.cmd == "sync":

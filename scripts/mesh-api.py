@@ -84,6 +84,13 @@ def _mesh(db_path):
                     "SELECT COUNT(*) FROM %s" % tbl).fetchone()[0]
             except Exception:
                 counts[key] = 0
+        actions = []
+        try:
+            actions = [dict(r) for r in db.execute(
+                "SELECT ts,finding_id,action,result,note FROM heal_actions"
+                " ORDER BY id DESC LIMIT 20")]
+        except Exception:
+            pass
         latency = []
         availability = {}
         try:
@@ -103,7 +110,8 @@ def _mesh(db_path):
             pass
         return 200, {"available": True, "nodes": nodes, "peers": peers,
                      "findings": findings, "counts": counts,
-                     "latency": latency, "availability": availability}
+                     "latency": latency, "availability": availability,
+                     "actions": actions}
     except Exception:
         return 503, {"available": False, "nodes": [], "peers": [],
                      "findings": [], "counts": {}}

@@ -1,0 +1,10 @@
+[Unit]
+Description=Record mesh latency sample (5-ping series to lighthouse)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Same DB rule as mesh-heal.service: user timers write the operator DB.
+Environment=MESH_INVENTORY_DB=%h/.local/share/mesh/inventory.db
+ExecStart=/usr/local/bin/mesh-latency --auto

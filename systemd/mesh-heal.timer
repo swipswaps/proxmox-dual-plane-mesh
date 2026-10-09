@@ -1,0 +1,10 @@
+[Unit]
+Description=Run mesh healer hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+Unit=mesh-heal.service
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Sample mesh latency every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=mesh-latency.service
+
+[Install]
+WantedBy=default.target
