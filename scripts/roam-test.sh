@@ -87,12 +87,22 @@ matrix() {
     fi
 }
 
+ssid_visible() {
+    nmcli device wifi rescan 2>&1 | head -n 1 || true
+    sleep 6
+    nmcli -t -f SSID device wifi list 2>&1 | grep -qxF "$1"
+}
+
 switch_to() {
     local ssid="$1" cur
     cur="$(current_ssid)"
     if [[ "${cur}" == "${ssid}" ]]; then
         printf 'already on %s\n' "${ssid}"
         return 0
+    fi
+    if ! ssid_visible "${ssid}"; then
+        printf '[ERROR] SSID %s not in range (enable the hotspot first?)\n' "${ssid}" >&2
+        return 1
     fi
     printf '[STEP] switching %s -> %s\n' "${cur:-none}" "${ssid}"
     nmcli c down "${cur}" > /dev/null 2>&1 || true
