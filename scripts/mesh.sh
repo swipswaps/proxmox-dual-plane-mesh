@@ -908,7 +908,7 @@ cmd_install_helpers() {
 
     log_step " symlinks /usr/local/bin/mesh-heal + mesh-latency"
     local h
-    for h in mesh-heal.sh mesh-latency.sh; do
+    for h in mesh-heal.sh mesh-latency.sh mesh-inventory.py; do
         [[ -x "${SELF_DIR}/${h}" ]] || die_fail "${h} not found or not executable"
         ln -sf "${SELF_DIR}/${h}" "/usr/local/bin/${h%.sh}" || die_fail "${h} symlink failed"
     done

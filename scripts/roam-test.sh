@@ -16,7 +16,7 @@
 # ==============================================================================
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 HOTSPOT="Samsung Galaxy A6 1394"
 HOME_SSID="belkin2"

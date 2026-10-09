@@ -28,7 +28,7 @@
 # ==============================================================================
 set -uo pipefail
 
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PASSFILE=""
 OUT_DIR="./backups"
 KEEP=5
