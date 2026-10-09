@@ -237,6 +237,8 @@ def main(argv=None):
     ap.add_argument("--db", default=INVENTORY_DEFAULT)
     ap.add_argument("--clientdb", default=CLIENT_DB_DEFAULT)
     ap.add_argument("--cert", default=os.environ.get("MESH_CERT_PATH", ""))
+    ap.add_argument("--tls-cert", default="",
+                    help="PEM bundle (cert+key) to serve HTTPS directly")
     ap.add_argument("--repo-root",
                     default=os.path.dirname(os.path.dirname(
                         os.path.abspath(__file__))))
@@ -244,7 +246,16 @@ def main(argv=None):
     cfg = {"inventory": args.db, "clientdb": args.clientdb,
            "cert": args.cert, "repo_root": args.repo_root}
     srv = HTTPServer((args.bind, args.port), make_handler(cfg))
-    print("mesh-api on http://%s:%d" % (args.bind, args.port), flush=True)
+    if args.tls_cert:
+        import ssl
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(args.tls_cert)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        print("mesh-api on https://%s:%d (TLS)" % (args.bind, args.port),
+              flush=True)
+    else:
+        print("mesh-api on http://%s:%d" % (args.bind, args.port), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
