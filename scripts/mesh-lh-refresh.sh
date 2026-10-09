@@ -39,8 +39,23 @@ main() {
     fi
     printf '%s change %s -> %s\n' "$TS" "$CUR" "$WANT" >> /var/log/mesh-lh-refresh.log || return 2
     "$SELF_DIR/mesh-lighthouse-cutover.sh" --set-public "$IP" "$2" || return 2
-    printf 'UPDATED %s\n' "$WANT"
-    return 0
+    # Verify the entry actually landed: 2026-10-09 proved .public-lh can
+    # claim an IP the map never received (silent loss, mesh dead off-LAN).
+    # This check fails LOUD so the timer unit goes red instead of lying.
+    if python3 -c "
+import sys, yaml
+want = sys.argv[1]
+cfg = yaml.safe_load(open('/etc/nebula/config.yml'))
+paths = (cfg.get('static_host_map', {}) or {}).get('10.100.0.1', []) or []
+sys.exit(0 if want in paths else 3)
+" "$WANT" 2>&1; then
+        printf '%s VERIFIED %s in static_host_map\n' "$TS" "$WANT" >> /var/log/mesh-lh-refresh.log || return 2
+        printf 'UPDATED %s\n' "$WANT"
+        return 0
+    fi
+    printf '%s MISMATCH %s not in static_host_map after cutover (map lost it!)\n' "$TS" "$WANT" >> /var/log/mesh-lh-refresh.log || true
+    fail "cutover claimed success but $WANT is absent from static_host_map"
+    return 2
 }
 
 main "$@"

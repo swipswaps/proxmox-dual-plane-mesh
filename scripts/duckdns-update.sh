@@ -6,6 +6,10 @@
 # https://www.duckdns.org (sign in, add subdomain, copy token).
 # Usage: duckdns-update.sh SUBDOMAIN  (e.g. mesh-lh01 -> mesh-lh01.duckdns.org)
 # Logs to ~/.local/state/duckdns/update.log. Detects egress IP automatically.
+# Home-SSID gate: with DUCKDNS_HOME_SSID set (or --only-ssid SSID), the
+# update is SKIPPED unless the active wifi SSID matches. Proven 2026-10-09:
+# a roaming client published its hotspot IP as the LIGHTHOUSE name and
+# broke the mesh for everyone until DHCP/DNS reverted. Never again.
 # Constraints: no sed, no 2>/dev/null, no set -e, no top-level exit.
 #
 set -uo pipefail
@@ -55,14 +59,33 @@ cmd_install() {
     return 0
 }
 
+current_ssid() {
+    nmcli -t -f NAME,DEVICE,STATE c show --active 2>&1 \
+        | awk -F: '$3 == "activated" && $2 ~ /^wl/ {print $1; exit}' || true
+}
+
 cmd_update() {
     if [ "$#" -lt 1 ]; then
-        fail 'usage: duckdns-update.sh SUBDOMAIN'
+        fail 'usage: duckdns-update.sh SUBDOMAIN [--only-ssid SSID]'
         return 2
+    fi
+    local home_ssid="${DUCKDNS_HOME_SSID:-}"
+    if [[ "${2:-}" == "--only-ssid" ]]; then
+        home_ssid="${3:-}"
+    fi
+    mkdir -p "$LOG_DIR" || return 2
+    if [[ -n "${home_ssid}" ]]; then
+        local cur
+        cur="$(current_ssid)"
+        if [[ "${cur}" != "${home_ssid}" ]]; then
+            printf '%s SKIP (ssid=%s, need %s; roaming IP must never become the lighthouse)\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${cur:-none}" "${home_ssid}" >> "$LOG_DIR/update.log" 2>&1 || true
+            printf 'SKIP: on %s, need %s (no publish)\n' "${cur:-none}" "${home_ssid}"
+            return 0
+        fi
     fi
     load_auth || return 2
     SUB="$1"
-    mkdir -p "$LOG_DIR" || return 2
     EGRESS="$(timeout 15 curl -sS --max-time 10 https://api.ipify.org 2>&1)" || return 2
     if [ -z "$EGRESS" ]; then
         fail 'egress IP detection failed'
