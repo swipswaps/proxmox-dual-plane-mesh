@@ -106,12 +106,20 @@ gate_refresher() {
 }
 
 gate_map() {
+    # Auth check FIRST: sudo's own error text ("a password is required")
+    # contains no IPs and must never be parsed as a map — a 2026-10-09
+    # false FAIL did exactly that under per-tty tickets.
+    if ! sudo -n true 2>&1; then
+        unknown "map unreadable here (sudo needs a tty password)" "sudo grep -A4 static_host_map /etc/nebula/config.yml"
+        record "map" "sudo needs tty"
+        return 0
+    fi
     local map
     map="$(sudo -n grep -A4 static_host_map /etc/nebula/config.yml 2>&1)" || true
     [[ -z "${map}" ]] && map=""
     if [[ -z "${map}" ]]; then
-        unknown "static_host_map unreadable (needs sudo)" "sudo grep -A4 static_host_map /etc/nebula/config.yml"
-        record "map" "unreadable without sudo"
+        unknown "static_host_map empty output" "sudo grep -A4 static_host_map /etc/nebula/config.yml"
+        record "map" "empty output"
         return 0
     fi
     local n
