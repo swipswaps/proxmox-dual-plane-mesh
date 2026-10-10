@@ -84,8 +84,9 @@ gate_helpers() {
 }
 
 gate_refresher() {
-    local active="no" last="?"
-    if systemctl list-timers 2>&1 | grep -q "mesh-lh-refresh"; then
+    local active="no" last="?" timers=""
+    timers="$(systemctl list-timers 2>&1)" || true
+    if printf '%s' "${timers}" | grep -q "mesh-lh-refresh"; then
         active="listed"
     fi
     if systemctl show -p LastTriggerUSec --value "mesh-lh-refresh@mesh-lh01.duckdns.org.timer" 2>&1 | grep -qE "20[0-9]{2}"; then
